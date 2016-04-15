@@ -210,8 +210,15 @@ def walk_workspace_tree():
     print 'Building list of local artifacts (source)'
     pom = initXML(os.path.normpath('./epom.xml'))
 
+    # an epom of a project with no children has a root tag of 'project', not 'projects'. We need to handle both
+    if pom.tag == 'project':
+        projects = (pom,)
+    else:
+        projects = pom.findall('project')
+    print len(projects)
+
     buckaliases = []
-    for project in pom.findall('project'):
+    for project in projects:
         deplist = []
         depexcl = []
         licenses = []
@@ -494,7 +501,11 @@ def get_grouped_dependencies(group,artifact,scope,conn):
             external.append(('//externals:%s' % dep['artifact']).encode('ascii','ignore'))
         else:
             dep2 = c.execute(FIND_HOMEDIR,(dep['group'],dep['artifact'],)).fetchone()
-            internal.append(('%s:%s' % (dep2['homedir'].replace('./','//'),dep['artifact'])).encode('ascii','ignore'))
+            if dep2 == None:
+                print "WARN: %s:%s appears to be a local artifact, but is being treaded as a [binary] external." % (group,artifact)
+                external.append(('//externals:%s' % dep['artifact']).encode('ascii','ignore'))
+            else:
+                internal.append(('%s:%s' % (dep2['homedir'].replace('./','//'),dep['artifact'])).encode('ascii','ignore'))
     c.close()
     return (internal, external)
 

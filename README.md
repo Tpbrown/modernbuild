@@ -13,6 +13,7 @@ Steps involved:
 7. Force a resolve of external (binary) dependencies.  _Please_ consider committing these into your source tree instead of fetching.
 8. Build and test the project.
 
+or simply:
 - mvn install
 - mvn help:effective-pom -Doutput=epom.xml
 - mvn dependency:resolve -DoutputFile=tdeps.txt

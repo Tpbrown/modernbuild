@@ -1,0 +1,7 @@
+- mvn install
+- mvn help:effective-pom -Doutput=epom.xml
+- mvn dependency:resolve -DoutputFile=tdeps.txt
+- ~/path/to/modernbuild .
+- buck targets
+- buck targets|xargs buck fetch
+- buck test

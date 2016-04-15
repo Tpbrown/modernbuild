@@ -1,0 +1,673 @@
+#!/usr/bin/env python
+import glob
+import fnmatch
+import os
+import xml.etree.ElementTree as ET
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
+
+import os
+import sys
+import copy
+import sqlite3
+import re
+import ConfigParser
+
+
+def removeNameSpace(it):
+    """Removes the namespaces from pom file
+    Eg. '{http://maven.apache.org/POM/4.0.0}id' is changed to 'id'
+    '{http://maven.apache.org/POM/4.0.0}property' is changed to 'property'
+    """
+    for _, el in it:
+        if '}' in el.tag:
+            el.tag = el.tag.split('}', 1)[1]  # strip all namespaces
+    return it
+
+
+def removeSetHash(content):
+    """Removes #set tags (if any) from pom file"""
+    index = 0
+    while content[index] != '<':
+        index = index + 1
+    return content[index:]
+
+
+def initXML(filePath):
+    """Init XML file for parsing, returns the head tag of the XML file"""
+    xml = ''
+    with open(filePath, "r") as xmlFile:
+        xml = xmlFile.read().replace('\n', '')
+    xml = removeSetHash(xml)
+    it = ET.iterparse(StringIO(xml))
+    it = removeNameSpace(it)
+    return it.root
+
+
+
+def getUniqueId(root):
+    """Returns the dictionary {groupId : ,artifactId : ,version :, packaging :}"""
+    # root = initXML(dirName, filename)
+    groupId = ''
+    artifactId = ''
+    version = ''
+    packaging = 'jar'
+    # makes project as the root tag
+    if not root.tag == "project":
+        root = root.find('project')
+
+    if root is None:
+        return {}
+
+    for child in root:
+        if child.tag == 'groupId':
+            groupId = child.text
+        if child.tag == 'artifactId':
+            artifactId = child.text
+        if child.tag == 'version':
+            version = child.text
+        if child.tag == 'packaging':
+            packaging = child.text
+
+    if not packaging:
+        raise Exception("%s is malformed. No packaging found." % artifactId)
+    temp = {}
+    temp['groupId'] = groupId
+    temp['artifactId'] = artifactId
+    temp['version'] = version
+    temp['packaging'] = packaging
+    return temp
+
+
+
+
+def get_m2_path(group, artifact, version, type='jar'):
+    mvn_cache = os.path.expanduser('~/.m2/repository')
+    folders = []
+    path = group.replace('.', '/')
+    while True:
+        path, folder = os.path.split(path)
+        if folder != "":
+            folders.append(folder)
+        else:
+            if path != "":
+                folders.append(path)
+            break
+    folders.reverse()
+    path = os.path.join(mvn_cache, '/'.join(folders), artifact,
+                        version, artifact + '-' + version + '.' + type)
+    if not os.path.exists(path):
+        path = None
+    return path
+
+
+
+def get_maven_sha1(group, artifact, version, classifier, type):
+    sha1 = ''
+    classystring = ''
+    mvn_cache = os.path.expanduser('~/.m2/repository')
+    folders = []
+    path = group.replace('.', '/')
+    while True:
+        path, folder = os.path.split(path)
+        if folder != "":
+            folders.append(folder)
+        else:
+            if path != "":
+                folders.append(path)
+            break
+    folders.reverse()
+
+    if classifier != '':
+        classystring ="-"+classifier
+
+    sha1file = "%s-%s%s.%s.sha1" % (artifact,version,classystring,type)
+
+    path = os.path.join(mvn_cache, '/'.join(folders), artifact,
+                        version, sha1file)
+
+    try:
+        f = open(os.path.expanduser(path))
+        sha1 = f.read(40)
+        f.close()
+    except IOError:
+        if os.path.exists(os.path.join(mvn_cache, '/'.join(folders), artifact, version, artifact + '-' + version + '.pom.sha1')):
+            raise TypeError("Dependency is a group.  Resolve the group.")
+
+        raise IOError(('WARN:' + artifact + " sha1 not found."))
+        # pass
+
+    return sha1
+
+
+def get_text_element(pom,tag,default=None):
+    retval = default
+    try:
+        return pom.find(tag).text
+    except AttributeError:
+        return default
+
+
+
+FIND_HOMEDIR = "SELECT homedir FROM project where project.groupid=? and project.artifactid=?"
+
+# Create tables
+PROJECT_TABLE = "CREATE TABLE 'project' ('groupid' TEXT,'artifactid' TEXT,'version' TEXT,'packaging' TEXT,'name' TEXT,'description' TEXT,'pgid' TEXT,'paid' TEXT,'pversion' TEXT,'ppath' TEXT,'srcdir' TEXT, 'testdir' TEXT, 'homedir' TEXT, 'datadir' TEXT)"
+PROJECT_INSERT = "INSERT INTO 'project' VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+PROJECT_UPDATE_PATHS = "UPDATE 'project' SET 'homedir' = ?, 'srcdir'=replace(srcdir,?,'.'), 'testdir'=replace(testdir,?,'.'), 'datadir'=replace(datadir,?,'.') WHERE (groupid=? AND artifactid=?)"
+
+LICENSE_INSERT_TABLE = "CREATE TABLE 'license' ('ogid' TEXT,'oaid' TEXT, 'name' TEXT, 'url' TEXT, 'distribution' TEXT, 'comments' TEXT)"
+LICENSE_INSERT = "INSERT INTO 'license' VALUES(?,?,?,?,?,?)"
+
+RESOURCE_TABLE = "CREATE TABLE 'resource' ('ogid' TEXT,'oaid' TEXT,'type' TEXT, 'targetpath' TEXT,'filtering' TEXT,'directory' TEXT,'include' TEXT, 'exclude' TEXT)"
+RESOURCE_INSERT = "INSERT INTO 'resource' VALUES(?,?,?,?,?,?,?,?)"
+
+DEP_TABLE="CREATE TABLE 'dependency' ('ogid' TEXT,'oaid' TEXT, 'groupid' TEXT,'artifactid' TEXT,'version' TEXT,'type' TEXT,'classifier' TEXT DEFAULT '','scope' TEXT DEFAULT 'compile','optional' INTEGER DEFAULT 0,'external' TEXT)"
+DEP_INSERT="INSERT INTO dependency VALUES(?,?,?,?,?,?,?,?,?,'')"
+DEP_EXCL_TABLE = "CREATE TABLE 'depexcl' ('ogid' TEXT,'oaid' TEXT, 'groupid' TEXT, 'artifactid' TEXT)"
+DEP_EXCL_INSERT = "INSERT INTO 'depexcl' VALUES(?,?,?,?)"
+
+def walk_workspace_tree():
+    cwd = ''
+
+    # basic .buckconfig
+    buckconfig = ConfigParser.ConfigParser()
+    buckconfig.add_section('alias')
+    buckconfig.add_section('maven_repositories')
+    buckconfig.add_section('build')
+    buckconfig.set('build','depfiles','cache')
+    buckconfig.add_section('project')
+    buckconfig.set('project','glob_handler','watchman')
+    buckconfig.set('project','build_file_search_method','watchman')
+    buckconfig.set('project','parallel_processing','true')
+
+    # String inserted at the top of all BUCK files.  Used to trigger editor language selection.
+    TARGET_HEADER = '#!/usr/bin/env python (only used to trigger editor language)\n'
+
+
+    # Create a SQLite db
+    conn = sqlite3.connect('./mvn.db')
+    # conn = sqlite3.connect(':memory:')
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    c.execute(DEP_TABLE)
+    c.execute(DEP_EXCL_TABLE)
+    c.execute(PROJECT_TABLE)
+    c.execute(LICENSE_INSERT_TABLE)
+    c.execute(RESOURCE_TABLE)
+    conn.commit()
+
+    print 'Building list of local artifacts (source)'
+    pom = initXML(os.path.normpath('./epom.xml'))
+
+    buckaliases = []
+    for project in pom.findall('project'):
+        deplist = []
+        depexcl = []
+        licenses = []
+        resources = []
+        pname = get_text_element(project,'name','')
+        pgid = get_text_element(project,'groupId')
+        paid = get_text_element(project,'artifactId')
+        print("Reading project %s (%s:%s)" % (pname,pgid,paid))
+
+        pversion = get_text_element(project,'version')
+        ppackage = get_text_element(project,'packaging','jar')
+        pdesc = get_text_element(project,'description')
+        ppgid = get_text_element(project,'parent/groupId')
+        ppaid = get_text_element(project,'parent/artifactId')
+        ppversion = get_text_element(project,'parent/version')
+        pppath = get_text_element(project,'parent/path')
+        cwd = os.getcwd()+'/'
+        homedirfull = os.path.commonprefix((get_text_element(project,'build/sourceDirectory'),get_text_element(project,'build/testSourceDirectory'),get_text_element(project,'build/outputDirectory'),get_text_element(project,'build/testOutputDirectory'),get_text_element(project,'build/directory')))
+        homedir = homedirfull.replace(cwd,'./').rstrip('/')
+
+        buckalias=os.path.normpath(homedir)
+        if buckalias!='.':
+            buckconfig.set('alias',buckalias,'//%s:%s' % (buckalias,paid))
+            buckaliases.append('//%s' % buckalias)
+
+        pappsource = get_text_element(project,'build/sourceDirectory').replace(homedirfull,'./')
+        ptstsource = get_text_element(project,'build/testSourceDirectory').replace(homedirfull,'./')
+        (datadir, junk) = os.path.split(pappsource)
+        datadir = os.path.join(datadir,'webapp')
+        pfinalname = get_text_element(project,'build/finalName')
+
+
+        for filter in project.findall('build/filters/filter'):
+            raise Exception("POM build/filters not supported yet.")
+
+        if pfinalname != (paid + '-' + pversion):
+            print pfinalname,pgid,pversion
+            raise Exception("POM build/finalName not supported yet.")
+
+        for license in project.findall('licenses/LICENSE_INSERT'):
+            lname = get_text_element(license,'name')
+            lurl = get_text_element(license,'url')
+            ldist = get_text_element(license,'distribution')
+            lcomment = get_text_element(license,'comment')
+            licenses.append((pgid,paid,lname,lurl,ldist,lcomment,))
+
+        for resource in project.findall('build/resources/resource'):
+            if os.path.exists(get_text_element(resource,'directory')):
+                rtarget = get_text_element(resource,'targetPath')
+                rfiltering = get_text_element(resource,'filtering')
+                rdirectory = os.path.normpath(get_text_element(resource,'directory').replace(homedirfull,'./').rstrip('/'))
+                rincludes = get_text_element(resource,'includes')
+                if rincludes == None:
+                    rincludes = '**/*.*'
+                rexcludes = get_text_element(resource,'excludes')
+                resources.append((pgid,paid,'app',rtarget,rfiltering,rdirectory,rincludes,rexcludes,))
+
+        for resource in project.findall('build/testResources/testResource'):
+            if os.path.exists(get_text_element(resource,'directory')):
+                rtarget = get_text_element(resource,'targetPath')
+                rfiltering = get_text_element(resource,'filtering')
+                rdirectory = os.path.normpath(get_text_element(resource,'directory').replace(homedirfull,'./').rstrip('/'))
+                rincludes = get_text_element(resource,'includes')
+                if rincludes == None:
+                    rincludes = '**/*.*'
+                rexcludes = get_text_element(resource,'excludes')
+                resources.append((pgid,paid,'test',rtarget,rfiltering,rdirectory,rincludes,rexcludes,))
+
+        # Direct dependencies are in the epom.xml
+        for dep in project.findall('dependencies/dependency'):
+            groupId = get_text_element(dep,'groupId')
+            artifactId = get_text_element(dep,'artifactId')
+            version = get_text_element(dep,'version')
+            scope = get_text_element(dep,'scope')
+            dtype = get_text_element(dep,'type','jar')
+            classifier = get_text_element(dep,'classifier')
+            t1 = get_text_element(dep,'optional')
+            if t1 != None and t1.upper().strip() == 'TRUE':
+                optional = 1
+            else: optional = 0
+            # Tuples for security on SQL inserts
+            for excl in dep.findall('exclusions/exclusion'):
+                depexcl.append((groupId,artifactId,get_text_element(excl,'groupId'),get_text_element(excl,'artifactId'),))
+
+            deplist.append((pgid,paid,groupId,artifactId,version,dtype,classifier,scope.lower(),optional))
+
+        # Transitive dependencies are in the tdeps.txt (effecive-poms are created prior to resolve)
+        deplist+=get_transitive_dependencies(pgid,paid,os.path.join(homedirfull,'tdeps.txt'))
+
+        # for line in
+        #     # Group, Artifact, atype, version, scope
+        #     if 'guice' in line[1]:
+        #         print "!!trans",(pgid,paid,line[0],line[1],line[2],line[3],line[4],line[5],0)
+        #     deplist.append((pgid,paid,line[0],line[1],line[2],line[3],line[4],line[5],0))
+        #
+        # Maven repositories in use.
+        for repo in project.findall('repositories/repository'):
+            buckconfig.set('maven_repositories',get_text_element(repo,'id'),get_text_element(repo,'url'))
+
+        # Project loop indent
+        print("\t%d licenses" % len(licenses))
+        print("\t%d dependencies" % len(deplist))
+        print("\t%d dependency exclusions" % len(depexcl))
+        print("\t%d resources" % len(resources))
+
+        c.execute(PROJECT_INSERT,(pgid,paid,pversion,ppackage,pname,pdesc,ppgid,ppaid,ppversion,pppath,pappsource,ptstsource,homedir,datadir))
+        c.executemany(LICENSE_INSERT,licenses)
+        c.executemany(RESOURCE_INSERT,resources)
+        c.executemany(DEP_INSERT,deplist)
+        c.executemany(DEP_EXCL_INSERT,depexcl)
+        conn.commit()
+
+    # Processing non-root POM. Only used to determine paths for buld files.
+    # if pom.tag != 'project':
+    #     pom = pom.find('project')
+
+
+    # c.execute(PROJECT_UPDATE_PATHS,(root,root,root,get_text_element(pom,'groupId'),get_text_element(pom,'artifactId'),))
+    c.execute("UPDATE dependency SET external='TRUE' WHERE EXISTS (SELECT 1 FROM project WHERE dependency.groupid!=project.groupid AND dependency.artifactid!=project.artifactid)")
+    conn.commit()
+    #
+
+    # buck configuration
+    # TODO: write a top-level alias that has everything (?)
+    # bigalias = get_text_element(pom,'project/artifactId')
+    # buckconfig.set('alias',bigalias, ' '.join(buckaliases))
+
+    print "\n\nWriting .buckconfig"
+    with open('.buckconfig', 'wb') as configfile:
+        buckconfig.write(configfile)
+    # write thirdparty depenencies to //externals
+    print "Writing third party dependencies to //externals"
+    if os.path.exists("./externals/BUCK"):
+        os.remove("./externals/BUCK")
+    if not os.path.exists("./externals"):
+        os.mkdir("./externals")
+
+    thirdparty = open("./externals/BUCK", "wr")
+    thirdparty.write(TARGET_HEADER)
+
+    # I know this isn't fast...but
+    EXTERNAL_SQL = "SELECT  distinct d.groupid,d.artifactid, d.type, d.version, d.classifier FROM dependency d INNER JOIN (SELECT groupid,artifactid,type,max(version) AS maxversion FROM dependency GROUP BY groupid,artifactid,type) grouped_d ON d.groupid=grouped_d.groupid AND d.artifactid=grouped_d.artifactid AND d.type=grouped_d.type AND d.version=grouped_d.maxversion WHERE exists (SELECT 1 FROM project p WHERE d.groupid!=p.groupid AND d.artifactid != p.artifactid) ORDER BY scope desc,d.groupid,d.artifactid"
+    for row in c.execute(EXTERNAL_SQL):
+        thirdparty.write(maven_dependency(row['groupid'],row['artifactid'],row['version'],row['classifier'],row['type']))
+    thirdparty.close()
+
+    # Targets for each of the descendants
+    for project in c.execute("SELECT * FROM project ORDER BY rowid"):
+        # 'groupid', 'artifactid', 'version', 'packaging', 'name', 'description', 'pgid', 'paid', 'pversion', 'ppath', 'srcdir', 'testdir']
+
+        # print project.rowid
+        buildfilepath = os.path.join(project['homedir'],'BUCK')
+        print "Writing buildfile",buildfilepath
+        if os.path.exists(buildfilepath):
+            os.remove(buildfilepath)
+        target = open(buildfilepath,'wr')
+        target.write(TARGET_HEADER)
+        target.write('\n' + generate_build_rule(project['groupid'],project['artifactid'],project['packaging'],project['homedir'],project['srcdir'].replace('./',''),project['testdir'].replace('./',''),project['datadir'].replace('./',''),conn))
+        target.close()
+
+    conn.close()
+
+
+def generate_build_rule(group,artifact,type,homedir,srcdir,testdir,datadir,conn):
+    tmpbuffer = ''
+    resource_string=''
+    resource_root_string=''
+
+    if type == 'jar':
+        # TODO - resources for tests
+        (resource_string,resource_root_string) = get_resource_param_strings(group,artifact,homedir,'app',conn)
+
+        tmpbuffer = generate_jar(artifact,group,artifact,homedir,srcdir,testdir,conn)
+    elif type=='war':
+        c = conn.cursor()
+        # Makeing things cleaner.  Create a variable that contains all dependencies in the rule.
+        (internal_deps, external_deps) = get_grouped_dependencies(group,artifact,'compile',conn)
+        tmpbuffer += "\n\nWAR_DEPS=[\n%s]\n\n" % (format_dep_string(sorted(internal_deps) + sorted(external_deps)))
+
+        # Final WAR (webapps folder + remapped classess + remapped jars)
+        tmpbuffer += ("zip_file(name='%s',out='%s.war', srcs=[':%s.webapp-sources',':%s.classes',':%s.libs'],visibility=['PUBLIC'],)\n" % (artifact,artifact,artifact,artifact,artifact))
+        # Contents of webapps dir
+        tmpbuffer += ("java_library(name='%s.webapp-sources',resources=glob(['%s/**/*.*']),resources_root='%s',)\n" % (artifact,datadir,datadir))
+        # java_library() to compile any source in the WAR itself
+        tmpbuffer += generate_jar(artifact+'.classes-sources',group,artifact,homedir,srcdir,testdir,conn,False)
+        # Zip file of all JAR dependencies
+        tmpbuffer += ("zip_file(name='%s.jars', srcs=WAR_DEPS,)\n" % (artifact))
+        # Zip file of this modules java_library, remapped into WEB-INF/classes
+        tmpbuffer += ("genrule(name='%s.classes',\n" % artifact)
+        tmpbuffer += ("\tcmd = 'mkdir -p WEB-INF/classes;unzip $(location :%s.classes-sources) -d WEB-INF/classes;zip -r $OUT WEB-INF',\n" % artifact)
+        tmpbuffer += ("\tout = '%s_classes.src.zip'\n\t)\n" % artifact)
+        # Zip file of all JAR dependencies, remapped into WEB-INF/lib
+        tmpbuffer += ("genrule(name='%s.libs',\n" % artifact)
+        tmpbuffer += ("\tcmd = 'mkdir -p WEB-INF/lib;unzip -j $(location :%s.jars) -d WEB-INF/lib;zip -r $OUT WEB-INF',\n" % artifact)
+        tmpbuffer += ("\tout = '%s.libs.src.zip'\n\t)\n" % artifact)
+    return tmpbuffer
+
+def get_resource_param_strings(group,artifact,homedir,restype,conn):
+    # Type: 'app', 'test', or 'webapp' (special case)
+    c=conn.cursor()
+    resources = []
+    tmp1 = []
+    resource_string='[]'
+    resource_root_string=''
+    for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type='app' ORDER BY directory",(group,artifact,)):
+        if os.path.exists(os.path.join(homedir,row['directory'])):
+            resources.append(row['directory'] + '/' + row['include'])
+            tmp1.append(row['directory'])
+    resources_root = os.path.commonprefix(tmp1)
+    if len(tmp1):
+        resource_string = (RESOURCE_PARAM % '\',\''.join(resources))
+    if resources_root != '':
+        resource_root_string = (RESOURCE_ROOT_PARAM % resources_root)
+    return (resource_string,resource_root_string)
+
+RESOURCE_PARAM='glob([\'%s\'])'
+RESOURCE_ROOT_PARAM='resources_root=\'%s\',\n\t'
+JAVA_LIBRARY_RULE_TEMPL = "java_library(\n\tname='%s',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tresources=%s,\n\t%sdeps=%s,\n\tprovided_deps=%s,\n\texported_deps=%s,\n\ttests=[%s],\n\tvisibility=%s,\n\t)"
+def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=True):
+    tmpbuffer = ''
+    testrulename = ''
+    tmptestbuffer = ''
+    resources = []
+    c = conn.cursor()
+
+    (dirname,targetname) = os.path.split(homedir)
+
+    if map_target and jarname != targetname:
+        message = "# WARN: target/directory name name (%s) does not match artifact name (%s).\n" % (targetname,jarname)
+        print message
+        # map the damn rules together so it feels more like it should.. (better yet - rename the damn directory)
+        tmpbuffer += message + '# Creating a rule that matches the target name.  This is a hack. Rename your directory.\n'
+        tmpbuffer += "prebuilt_jar(name='%s',deps=[':%s'],binary_jar=':%s')\n\n" % (targetname,jarname,jarname)
+
+    autodeps = True
+    exported_deps=[]
+
+    # All external deps are exported.
+    (compile_deps, external_deps) = get_grouped_dependencies(group,artifact,'compile',conn)
+    exported_deps+=external_deps
+    (provided_deps, external_deps) = get_grouped_dependencies(group,artifact,'provided',conn)
+    exported_deps+=external_deps
+
+    # calculate our resouce list, and resource root
+    c=conn.cursor()
+    app_resources = []
+    tmp1 = []
+    resource_string='[]'
+    resource_root_string=''
+    for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type='app' ORDER BY directory",(group,artifact,)):
+        if os.path.exists(os.path.join(homedir,row['directory'])):
+            app_resources.append(row['directory'] + '/' + row['include'])
+            tmp1.append(row['directory'])
+    app_resources_root = os.path.commonprefix(tmp1)
+    if len(tmp1):
+        resource_string = (RESOURCE_PARAM % '\',\''.join(app_resources))
+    if app_resources_root != '':
+        resource_root_string = (RESOURCE_ROOT_PARAM % app_resources_root)
+
+    # If we have an associated test generate a rule for it too
+    if os.path.exists(os.path.join(homedir,testdir)):
+        testrulename = '\':' + artifact + '-test\''
+        tmptestbuffer += generate_java_test(group,artifact,homedir,testdir,conn)
+
+    tmpbuffer += (JAVA_LIBRARY_RULE_TEMPL % (jarname,autodeps,srcdir,resource_string,resource_root_string,('[\n' + format_dep_string(sorted(compile_deps)) + '\t\t]'),('[\n' + format_dep_string(sorted(provided_deps)) + '\t\t]'),('[\n' + format_dep_string(sorted(exported_deps))+ '\t\t]'), testrulename,"['PUBLIC']"))
+    tmpbuffer += ('\n\n' + tmptestbuffer)
+
+    return tmpbuffer
+
+def format_dep_string(mylist):
+    retval = ''
+    for i in mylist:
+        retval += ("\t\t'%s',\n" % i)
+    return retval
+
+def get_grouped_dependencies(group,artifact,scope,conn):
+    internal = []
+    external = []
+    c=conn.cursor()
+    funcname = "get_%s_dependency_list(group,artifact,c)" % scope
+    for dep in eval(funcname):
+    # for dep in  get_compile_dependency_list(group,artifact,c):
+        if dep['external'] == 'TRUE':
+            external.append(('//externals:%s' % dep['artifact']).encode('ascii','ignore'))
+        else:
+            dep2 = c.execute(FIND_HOMEDIR,(dep['group'],dep['artifact'],)).fetchone()
+            internal.append(('%s:%s' % (dep2['homedir'].replace('./','//'),dep['artifact'])).encode('ascii','ignore'))
+    c.close()
+    return (internal, external)
+
+def get_compile_dependency_list(group,artifact,c):
+    retval = []
+    for row in c.execute("SELECT distinct groupid,artifactid,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?,?) ORDER BY groupid,artifactid",(group,artifact,'compile','runtime')):
+        retval.append({'group': row['groupid'], 'artifact': row['artifactid'], 'version': row['version'],'external': row['external']})
+    return retval
+
+def get_test_dependency_list(group,artifact,c):
+    retval = []
+    for row in c.execute("SELECT distinct groupid,artifactid,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?) ORDER BY groupid,artifactid",(group,artifact,'test')):
+        retval.append({'group': row['groupid'], 'artifact': row['artifactid'], 'version': row['version'],'external': row['external']})
+    return retval
+
+def get_provided_dependency_list(group,artifact,c):
+    retval = []
+    for row in c.execute("SELECT distinct groupid,artifactid,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?) ORDER BY groupid,artifactid",(group,artifact,'provided')):
+        retval.append({'group': row['groupid'], 'artifact': row['artifactid'], 'version': row['version'],'external': row['external']})
+    return retval
+
+def get_transitive_dependencies(pgid,paid,filepath):
+    deplist = []
+    f = open(filepath)
+    for deptxt in f.readlines():
+        # (.+):(.+):(.+):(.+):(.+) = junit:junit:jar:4.11:test
+        #    com.google.inject:guice:jar:no_aop:4.0:compile
+        # check for classifier, if not found then check without
+        tmpval = re.match(r"\s+(?P<group>.+):(?P<artifact>.+):(?P<type>.+):(?P<classifier>.+):(?P<version>.+):(?P<scope>.+)",deptxt)
+        if not tmpval:
+            tmpval = re.match(r"\s+(?P<group>.+):(?P<artifact>.+):(?P<type>.+):(?P<version>.+):(?P<scope>.+)",deptxt)
+            classifier=None
+        else:
+            classifier=tmpval.group('classifier')
+        if tmpval != None:
+            if ':' in tmpval.group('group'): raise Exception("Error in regex")
+            deplist.append((pgid,paid,tmpval.group('group'),tmpval.group('artifact'),tmpval.group('version'),tmpval.group('type'),classifier,tmpval.group('scope'),0))
+    f.close()
+
+    return deplist
+
+def get_dependency_tree(filepath,conn):
+    c=conn.cursor()
+    f = open(filepath)
+    aggregating=True
+    for deptxt in f.readlines():
+        if deptxt[0]=='#':
+            # TGF file switches from defining nodes to mapping nodes after the line with only a hash (#)
+            aggregating=False
+            conn.commit()
+            continue
+
+        if aggregating:
+            # Aggregating list of dependencies
+            line = re.match(r"(?P<id>.+)\s+(?P<g>.+):(?P<a>.+):(?P<t>.+):(?P<v>.+):(?P<s>.+)",deptxt)
+            if not line:  # Regex failed, scope is likely dropped.
+                line = re.match(r"(?P<id>.+)\s+(?P<g>.+):(?P<a>.+):(?P<t>.+):(?P<v>.+)",deptxt)
+                scope = ''
+            else:
+                scope = line.group('s')
+            # Temp insert to process later.
+            c.execute(DEP_INSERT,(line.group('id'),'self',line.group('g'),line.group('a'),line.group('v'),line.group('t'),None,scope,0))
+        else:
+            # Mapping the relationships between the dependencies
+            line = re.match(r"(?P<from>.+)\s+(?P<to>.+)\s+(?P<scope>.+)",deptxt)
+            from_dep = c.execute("SELECT groupid,artifactid FROM dependency where ogid=? AND oaid='self'", (line.group('from'),)).fetchone()
+            to_dep = c.execute("SELECT groupid,artifactid,version,type FROM dependency where ogid=? AND oaid='self'", (line.group('to'),)).fetchone()
+            # print from_dep,">>",to_dep
+            c.execute(DEP_INSERT,(from_dep['groupid'],from_dep['artifactid'],to_dep['groupid'],to_dep['artifactid'],to_dep['version'],to_dep['type'],None,line.group('scope'),0))
+    f.close()
+    c.close()
+    return
+
+def generate_java_test(group,artifact,homedir,testdir,conn):
+    RULE_TEMPL = "java_test(\n\tname='%s-test',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tsource_under_test=[':%s'],\n\tresources=%s,\n\t%sdeps=%s,\n\tvisibility=%s,\n\t)"
+    # RULE_TEMPL = "java_test(\n\tname='%s-test',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tresources=%s,%s\n\tsource_under_test=[':%s'],\n\t%sdeps=%s,\n\tvisibility=%s,\n\t)"
+    tmpbuffer = ''
+    testrule = ''
+    resource_string= '[]'
+    c = conn.cursor()
+
+    (dirname,targetname) = os.path.split(homedir)
+
+    autodeps = True
+    external_deps = []
+    (test_deps,external) = get_grouped_dependencies(group,artifact,'test',conn)
+    external_deps += external
+    (compile_deps,external) = get_grouped_dependencies(group,artifact,'compile',conn)
+    external_deps += external
+    depstring =  ('[\n%s\t\t]' % format_dep_string([':%s' % artifact] + test_deps + compile_deps + sorted(external_deps)))
+
+    test_resources = []
+    tmp1 = []
+    # note that test resources include both 'app' and 'test'
+    for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? ORDER BY directory",(group,artifact,)):
+        if os.path.exists(os.path.join(homedir,row['directory'])):
+            test_resources.append(row['directory'] + '/' + row['include'])
+            tmp1.append(row['directory'])
+    test_resources_root = os.path.normpath(os.path.commonprefix(tmp1))
+    if len(tmp1):
+        resource_string = (RESOURCE_PARAM % '\',\''.join(test_resources))
+    if test_resources_root != '':
+        resource_root_string = (RESOURCE_ROOT_PARAM % test_resources_root)
+    tmpbuffer += (RULE_TEMPL % (artifact,autodeps,testdir,artifact,resource_string,resource_root_string,depstring,"['PUBLIC']"))
+    # tmpbuffer += (RULE_TEMPL % (artifact,autodeps,testdir,resource_string,resource_root_string,artifact,('[\n' + internal_deps + external_deps + '\t\t]'),"['PUBLIC']"))
+    return tmpbuffer
+
+def maven_dependency(group,artifact,version,classifier,type):
+    # get the SHA1 for the dependency.
+    tmpbuffer = ""
+    message = ''
+    if classifier == None:
+        classifier=''
+    try:
+        sha1 = get_maven_sha1(group,artifact,version,classifier,type)
+
+        tmpbuffer += ("\nprebuilt_%s" % type)
+        tmpbuffer += "(name='%s', binary_jar=':%s-%s'," % (artifact,artifact,type)
+        tmpbuffer += "visibility = ['PUBLIC',],)\n"
+
+        tmpbuffer += "remote_file(name='%s-%s', url='mvn:%s:%s:%s:%s', sha1='%s',)\n" % (
+            artifact,
+            type,
+            group,
+            artifact,
+            type,
+            version,
+            sha1
+        )
+        return tmpbuffer
+    except TypeError:
+        origgroup = group
+        origartifact = artifact
+        origversion = version
+        origtype = type
+
+
+        (group,artifact,version,type,message) = get_maven_redirect(group,artifact,version)
+        usermessage="WARN: artifact %s:%s:%s:%s replaced with %s:%s:%s:%s\n" % (origgroup,origartifact,origtype,origversion,group,artifact,type,version)
+        print usermessage
+        tmpbuffer += '#' + usermessage
+        # map the damn redirect in a rule.  Fix your dependencies.
+        tmpbuffer += '# ' + message + '\n# Creating a rule that matches the redirected artifact.  This is a hack. Fix your dependency.\n'
+        tmpbuffer += "prebuilt_jar(name='%s',deps=[':%s'],binary_jar=':%s',visibility=['PUBLIC'])\n\n" % (origartifact,artifact,artifact)
+
+    return tmpbuffer
+
+def get_maven_redirect(group,artifact,version):
+    # The dependency is actually to a pom file.  This represents a group, so find it's dependencies and insert them.
+    # This may be due to using a deprecated dependency.
+    tmppom = initXML(get_m2_path(group, artifact, version, 'pom'))
+    tag = tmppom.find('distributionManagement/relocation')
+    if tag != None:
+        tag = tmppom.find(
+            'distributionManagement/relocation')
+        newartifact = get_text_element(tag,'artifactId')
+        newversion = get_text_element(tag,'version')
+        targetpom = initXML(get_m2_path(group,newartifact,newversion,'pom'))
+        if tag == None:
+            raise Exception("Dependency %s redirected to %s but %s cannot be found." % (artifact,newartifact,newartifact))
+        newtype = get_text_element(targetpom,'packaging','jar')
+        message = get_text_element(tag,'message')
+        return (group,newartifact,newversion,newtype,message)
+    else:
+        return None
+
+
+matches = []
+property_excludes = [
+    'schema.version', 'package.name', 'outputEncoding',
+    'sourceEncoding', 'restApiOutputDirectory',
+    'restApiSourceDirectory', 'asciidoctor', 'start-class', 'printSummary'
+]
+
+localmodules = {}
+remotemodules = {}
+processed_modules = []
+# process_effective_poms("./build.properties", "./config.properties")
+walk_workspace_tree()

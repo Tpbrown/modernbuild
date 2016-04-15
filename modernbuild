@@ -472,7 +472,7 @@ def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=T
         testrulename = '\':' + artifact + '-test\''
         tmptestbuffer += generate_java_test(group,artifact,homedir,testdir,conn)
 
-    tmpbuffer += (JAVA_LIBRARY_RULE_TEMPL % (jarname,autodeps,srcdir,resource_string,resource_root_string,('[\n' + format_dep_string(sorted(compile_deps)) + '\t\t]'),('[\n' + format_dep_string(sorted(provided_deps)) + '\t\t]'),('[\n' + format_dep_string(sorted(exported_deps))+ '\t\t]'), testrulename,"['PUBLIC']"))
+    tmpbuffer += (JAVA_LIBRARY_RULE_TEMPL % (jarname,autodeps,srcdir,resource_string,resource_root_string,('[\n' + format_dep_string(sorted(set(compile_deps))) + '\t\t]'),('[\n' + format_dep_string(sorted(set(provided_deps))) + '\t\t]'),('[\n' + format_dep_string(sorted(set(exported_deps)))+ '\t\t]'), testrulename,"['PUBLIC']"))
     tmpbuffer += ('\n\n' + tmptestbuffer)
 
     return tmpbuffer
@@ -584,7 +584,7 @@ def generate_java_test(group,artifact,homedir,testdir,conn):
     external_deps += external
     (compile_deps,external) = get_grouped_dependencies(group,artifact,'compile',conn)
     external_deps += external
-    depstring =  ('[\n%s\t\t]' % format_dep_string([':%s' % artifact] + test_deps + compile_deps + sorted(external_deps)))
+    depstring =  ('[\n%s\t\t]' % format_dep_string([':%s' % artifact] + sorted(set(test_deps + compile_deps)) + sorted(set(external_deps))))
 
     test_resources = []
     tmp1 = []

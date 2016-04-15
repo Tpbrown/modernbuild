@@ -14,6 +14,7 @@ import copy
 import sqlite3
 import re
 import ConfigParser
+import subprocess
 
 
 def removeNameSpace(it):
@@ -127,6 +128,9 @@ def get_maven_sha1(group, artifact, version, classifier, type):
 
     path = os.path.join(mvn_cache, '/'.join(folders), artifact,
                         version, sha1file)
+    targetfile = os.path.normpath(os.path.join(mvn_cache, '/'.join(folders), artifact,
+                        version, "%s-%s%s.%s" % (artifact,version,classystring,type)))
+
 
     try:
         f = open(os.path.expanduser(path))
@@ -135,8 +139,11 @@ def get_maven_sha1(group, artifact, version, classifier, type):
     except IOError:
         if os.path.exists(os.path.join(mvn_cache, '/'.join(folders), artifact, version, artifact + '-' + version + '.pom.sha1')):
             raise TypeError("Dependency is a group.  Resolve the group.")
+        if os.path.exists(os.path.join(mvn_cache, '/'.join(folders), artifact, version, artifact + '-' + version + '.' + type)):
+            # No sha1 provided.  Calculate it.
+            sha1 = subprocess.check_output(['shasum','-p',targetfile])[0:40]
 
-        raise IOError(('WARN:' + artifact + " sha1 not found."))
+        # raise IOError(('WARN:' + artifact + " sha1 not found."))
         # pass
 
     return sha1
@@ -225,7 +232,7 @@ def walk_workspace_tree():
         homedirfull = os.path.commonprefix((get_text_element(project,'build/sourceDirectory'),get_text_element(project,'build/testSourceDirectory'),get_text_element(project,'build/outputDirectory'),get_text_element(project,'build/testOutputDirectory'),get_text_element(project,'build/directory')))
         homedir = homedirfull.replace(cwd,'./').rstrip('/')
 
-        buckalias=os.path.normpath(homedir)
+        (junk,buckalias)=os.path.split(os.path.normpath(homedir))
         if buckalias!='.':
             buckconfig.set('alias',buckalias,'//%s:%s' % (buckalias,paid))
             buckaliases.append('//%s' % buckalias)
@@ -240,9 +247,10 @@ def walk_workspace_tree():
         for filter in project.findall('build/filters/filter'):
             raise Exception("POM build/filters not supported yet.")
 
-        if pfinalname != (paid + '-' + pversion):
-            print pfinalname,pgid,pversion
-            raise Exception("POM build/finalName not supported yet.")
+        if pfinalname != None and ((pfinalname != (paid + '-' + pversion)) and (pfinalname != paid)):
+            # print pfinalname,pgid,pversion
+            # raise Exception("POM build/finalName not supported yet.")
+            print "WARN: POM build/finalName not supported. Final name of %s ignored. Expect a name based off %s-%s" % (pfinalname,paid,pversion)
 
         for license in project.findall('licenses/LICENSE_INSERT'):
             lname = get_text_element(license,'name')
@@ -294,15 +302,10 @@ def walk_workspace_tree():
         # Transitive dependencies are in the tdeps.txt (effecive-poms are created prior to resolve)
         deplist+=get_transitive_dependencies(pgid,paid,os.path.join(homedirfull,'tdeps.txt'))
 
-        # for line in
-        #     # Group, Artifact, atype, version, scope
-        #     if 'guice' in line[1]:
-        #         print "!!trans",(pgid,paid,line[0],line[1],line[2],line[3],line[4],line[5],0)
-        #     deplist.append((pgid,paid,line[0],line[1],line[2],line[3],line[4],line[5],0))
-        #
         # Maven repositories in use.
         for repo in project.findall('repositories/repository'):
             buckconfig.set('maven_repositories',get_text_element(repo,'id'),get_text_element(repo,'url'))
+
 
         # Project loop indent
         print("\t%d licenses" % len(licenses))
@@ -431,7 +434,7 @@ def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=T
     c = conn.cursor()
 
     (dirname,targetname) = os.path.split(homedir)
-
+    map_target = False
     if map_target and jarname != targetname:
         message = "# WARN: target/directory name name (%s) does not match artifact name (%s).\n" % (targetname,jarname)
         print message

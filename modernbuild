@@ -188,8 +188,8 @@ def walk_workspace_tree():
 
 
     # Create a SQLite db
-    conn = sqlite3.connect('./mvn.db')
-    # conn = sqlite3.connect(':memory:')
+    # conn = sqlite3.connect('./mvn.db')
+    conn = sqlite3.connect(':memory:')
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 

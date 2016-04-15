@@ -61,3 +61,5 @@ curl
 
 $vim externals/BUCK  # Fix the SHA1 errors
 $buck test
+```
+It'll still fail because we'ren not generating source with Modello, but you get the idea...

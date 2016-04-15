@@ -37,14 +37,27 @@ Many.
 
 ###example:
 ```
-cd ~
-git clone https://github.com/tpbrown/modernbuild
-git clone https://github.com/apache/maven
-cd maven
-mvn install
-mvn help:effective-pom -Doutput=epom.xml
-mvn dependency:resolve -DoutputFile=tdeps.txt
-~/modernbuild/modernbuild .
-buck targets
-buck targets|xarg buck fetch
-buck test
+$cd ~
+$git clone https://github.com/tpbrown/modernbuild
+$git clone https://github.com/apache/maven
+$cd maven
+$mvn install
+$mvn help:effective-pom -Doutput=epom.xml
+$mvn dependency:resolve -DoutputFile=tdeps.txt
+$~/modernbuild/modernbuild .
+$buck targets
+$buck targets|xarg buck fetch
+```
+[-] PARSING BUCK FILES...FINISHED 0.1s [100%]
+Unable to download mvn:com.google.inject:guice:jar:4.0 (hashes do not match. **Expected 199b7acaa05b570bbccf31be998f013963e5e752, saw 0f990a43d3725781b6db7cd0acf0a8b62dfd1649**)
+Unable to download mvn:org.apache.maven.wagon:wagon-http:jar:2.10 (hashes do not match. **Expected 4ef309c09abb5f8b2d0c6a4010205db185729cdc, saw b611dd343b14014af6201dd87d121b8d9a7eb5e1**)
+BUILD FAILED: //externals:guice-jar failed with exit code -1:
+curl
+[-] PROCESSING BUCK FILES...FINISHED 0.2s
+[-] DOWNLOADING... (0.00 B/S AVG, TOTAL: 0.00 B, 0 Artifacts)
+[-] BUILDING...FINISHED 5.7s [100%] (37/39 JOBS, 35 UPDATED, 89.7% CACHE MISS)
+
+```
+
+$vim externals/BUCK  # Fix the SHA1 errors
+$buck test

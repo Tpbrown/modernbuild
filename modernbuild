@@ -195,8 +195,8 @@ def walk_workspace_tree():
 
 
     # Create a SQLite db
-    # conn = sqlite3.connect('./mvn.db')
-    conn = sqlite3.connect(':memory:')
+    conn = sqlite3.connect('./mvn.db')
+    # conn = sqlite3.connect(':memory:')
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
@@ -333,7 +333,10 @@ def walk_workspace_tree():
 
 
     # c.execute(PROJECT_UPDATE_PATHS,(root,root,root,get_text_element(pom,'groupId'),get_text_element(pom,'artifactId'),))
+    # c.execute("UPDATE dependency SET external='WARN' WHERE EXISTS (SELECT 1 FROM project WHERE dependency.groupid==project.groupid)")
     c.execute("UPDATE dependency SET external='TRUE' WHERE EXISTS (SELECT 1 FROM project WHERE dependency.groupid!=project.groupid AND dependency.artifactid!=project.artifactid)")
+    c.execute("UPDATE dependency SET external='WARN'  WHERE dependency.groupid <=  (SELECT max(groupid) FROM project) and dependency.groupid >= (select min(groupid) from project)")
+    c.execute("UPDATE dependency SET external='FALSE' WHERE EXISTS (SELECT 1 FROM project WHERE dependency.groupid==project.groupid)")
     conn.commit()
     #
 
@@ -356,9 +359,22 @@ def walk_workspace_tree():
     thirdparty.write(TARGET_HEADER)
 
     # I know this isn't fast...but
-    EXTERNAL_SQL = "SELECT  distinct d.groupid,d.artifactid, d.type, d.version, d.classifier FROM dependency d INNER JOIN (SELECT groupid,artifactid,type,max(version) AS maxversion FROM dependency GROUP BY groupid,artifactid,type) grouped_d ON d.groupid=grouped_d.groupid AND d.artifactid=grouped_d.artifactid AND d.type=grouped_d.type AND d.version=grouped_d.maxversion WHERE exists (SELECT 1 FROM project p WHERE d.groupid!=p.groupid AND d.artifactid != p.artifactid) ORDER BY scope desc,d.groupid,d.artifactid"
+    # EXTERNAL_SQL = "SELECT  distinct d.groupid,d.artifactid, d.type, d.version, d.classifier FROM dependency d INNER JOIN (SELECT groupid,artifactid,type,max(version) AS maxversion FROM dependency GROUP BY groupid,artifactid,type) grouped_d ON d.groupid=grouped_d.groupid AND d.artifactid=grouped_d.artifactid AND d.type=grouped_d.type AND d.version=grouped_d.maxversion WHERE exists (SELECT 1 FROM project p WHERE d.groupid!=p.groupid AND d.artifactid != p.artifactid) ORDER BY scope desc,d.groupid,d.artifactid"
+    EXTERNAL_SQL = "SELECT  distinct d.groupid,d.artifactid, d.type, d.version, d.classifier, d.external FROM dependency d WHERE external='TRUE' or external='WARN' ORDER BY d.external desc,d.groupid,d.artifactid,d.classifier, d.scope"
+    lastgroup = ''
     for row in c.execute(EXTERNAL_SQL):
+        if row['groupid'] != lastgroup:
+            thirdparty.write("\n\n# %s dependencies" % row['groupid'])
+            lastgroup=row['groupid']
+        if row['external'] == 'WARN':
+            thirdparty.write('\n# WARN - Dependency appears to be local, but source not found.')
         thirdparty.write(maven_dependency(row['groupid'],row['artifactid'],row['version'],row['classifier'],row['type']))
+    # top-level target so we can just 'buck fetch externals'.
+    biglist = []
+    for row in c.execute(EXTERNAL_SQL):
+        biglist.append('//externals:' + row['artifactid'])
+    thirdparty.write("\n\n# Rule to ease downloading externals.  But really people, DON'T.  Check them in.")
+    thirdparty.write("\ngenrule(name='externals', cmd='touch $OUT', out='noop.txt', srcs=[\n\t'%s'\n\t],)" % '\',\n\t\''.join(biglist))
     thirdparty.close()
 
     # Targets for each of the descendants
@@ -383,13 +399,13 @@ def generate_build_rule(group,artifact,type,homedir,srcdir,testdir,datadir,conn)
     resource_string=''
     resource_root_string=''
 
+    c = conn.cursor()
     if type == 'jar':
         # TODO - resources for tests
         (resource_string,resource_root_string) = get_resource_param_strings(group,artifact,homedir,'app',conn)
 
         tmpbuffer = generate_jar(artifact,group,artifact,homedir,srcdir,testdir,conn)
     elif type=='war':
-        c = conn.cursor()
         # Makeing things cleaner.  Create a variable that contains all dependencies in the rule.
         (internal_deps, external_deps) = get_grouped_dependencies(group,artifact,'compile',conn)
         tmpbuffer += "\n\nWAR_DEPS=[\n%s]\n\n" % (format_dep_string(sorted(internal_deps) + sorted(external_deps)))
@@ -410,27 +426,39 @@ def generate_build_rule(group,artifact,type,homedir,srcdir,testdir,datadir,conn)
         tmpbuffer += ("genrule(name='%s.libs',\n" % artifact)
         tmpbuffer += ("\tcmd = 'mkdir -p WEB-INF/lib;unzip -j $(location :%s.jars) -d WEB-INF/lib;zip -r $OUT WEB-INF',\n" % artifact)
         tmpbuffer += ("\tout = '%s.libs.src.zip'\n\t)\n" % artifact)
+    elif type=='pom':
+        # Aggregate type.   Write out a no-op rule so that we can pull in the dependencies instead.
+        (internal_deps, external_deps) = get_grouped_dependencies(group,artifact,'compile',conn)
+        deplist = sorted(set(internal_deps + external_deps))
+
+        tmpbuffer += ("genrule(name='%s', out='%s.noop', srcs=[\n%s], cmd='touch $OUT',visibility=['PUBLIC',],)\n" % (artifact,artifact,format_dep_string(deplist)))
+    else:
+        print "WARN: Type %s is unsupported. Skipping" % type
+
+    c.close()
     return tmpbuffer
 
 def get_resource_param_strings(group,artifact,homedir,restype,conn):
     # Type: 'app', 'test', or 'webapp' (special case)
     c=conn.cursor()
     resources = []
+    resource_excludes=[]
     tmp1 = []
     resource_string='[]'
     resource_root_string=''
     for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type='app' ORDER BY directory",(group,artifact,)):
         if os.path.exists(os.path.join(homedir,row['directory'])):
-            resources.append(row['directory'] + '/' + row['include'])
+            resources.append(row['directory'] + '/' + row['include'].strip())
+            if row['exclude']: resource_excludes.append(row['exclude'].strip())
             tmp1.append(row['directory'])
     resources_root = os.path.commonprefix(tmp1)
     if len(tmp1):
-        resource_string = (RESOURCE_PARAM % '\',\''.join(resources))
+        resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(resources))),'\',\''.join(sorted(set(resource_excludes))).strip()))
     if resources_root != '':
         resource_root_string = (RESOURCE_ROOT_PARAM % resources_root)
     return (resource_string,resource_root_string)
 
-RESOURCE_PARAM='glob([\'%s\'])'
+RESOURCE_PARAM='glob([\'%s\'], excludes=[\'%s\'])'
 RESOURCE_ROOT_PARAM='resources_root=\'%s\',\n\t'
 JAVA_LIBRARY_RULE_TEMPL = "java_library(\n\tname='%s',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tresources=%s,\n\t%sdeps=%s,\n\tprovided_deps=%s,\n\texported_deps=%s,\n\ttests=[%s],\n\tvisibility=%s,\n\t)"
 def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=True):
@@ -461,23 +489,27 @@ def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=T
     # calculate our resouce list, and resource root
     c=conn.cursor()
     app_resources = []
+    app_resources_exclude = []
     tmp1 = []
     resource_string='[]'
+    resource_excludes_string='[]'
     resource_root_string=''
     for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type='app' ORDER BY directory",(group,artifact,)):
         if os.path.exists(os.path.join(homedir,row['directory'])):
-            app_resources.append(row['directory'] + '/' + row['include'])
+            app_resources.append(row['directory'] + '/' + row['include'].strip())
+            if row['exclude']: app_resources_exclude.append(row['exclude'].strip())
             tmp1.append(row['directory'])
-    app_resources_root = os.path.commonprefix(tmp1)
+    app_resources_root = os.path.commonprefix(set(tmp1))
     if len(tmp1):
-        resource_string = (RESOURCE_PARAM % '\',\''.join(app_resources))
+        resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(app_resources))).strip(),'\',\''.join(sorted(set(app_resources_exclude))).strip()))
+
     if app_resources_root != '':
         resource_root_string = (RESOURCE_ROOT_PARAM % app_resources_root)
 
     # If we have an associated test generate a rule for it too
     if os.path.exists(os.path.join(homedir,testdir)):
         testrulename = '\':' + artifact + '-test\''
-        tmptestbuffer += generate_java_test(group,artifact,homedir,testdir,conn)
+        tmptestbuffer += generate_java_test(jarname,group,artifact,homedir,testdir,conn)
 
     tmpbuffer += (JAVA_LIBRARY_RULE_TEMPL % (jarname,autodeps,srcdir,resource_string,resource_root_string,('[\n' + format_dep_string(sorted(set(compile_deps))) + '\t\t]'),('[\n' + format_dep_string(sorted(set(provided_deps))) + '\t\t]'),('[\n' + format_dep_string(sorted(set(exported_deps)))+ '\t\t]'), testrulename,"['PUBLIC']"))
     tmpbuffer += ('\n\n' + tmptestbuffer)
@@ -579,9 +611,8 @@ def get_dependency_tree(filepath,conn):
     c.close()
     return
 
-def generate_java_test(group,artifact,homedir,testdir,conn):
-    RULE_TEMPL = "java_test(\n\tname='%s-test',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tsource_under_test=[':%s'],\n\tresources=%s,\n\t%sdeps=%s,\n\tvisibility=%s,\n\t)"
-    # RULE_TEMPL = "java_test(\n\tname='%s-test',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tresources=%s,%s\n\tsource_under_test=[':%s'],\n\t%sdeps=%s,\n\tvisibility=%s,\n\t)"
+def generate_java_test(jarname,group,artifact,homedir,testdir,conn):
+    RULE_TEMPL = "java_test(\n\tname='%s-test',\n\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tsource_under_test=[':%s'],\n\tresources=%s,\n\t%sdeps=%s,\n\tvisibility=%s,\n\t)\n"
     tmpbuffer = ''
     testrule = ''
     resource_string= '[]'
@@ -595,22 +626,23 @@ def generate_java_test(group,artifact,homedir,testdir,conn):
     external_deps += external
     (compile_deps,external) = get_grouped_dependencies(group,artifact,'compile',conn)
     external_deps += external
-    depstring =  ('[\n%s\t\t]' % format_dep_string([':%s' % artifact] + sorted(set(test_deps + compile_deps)) + sorted(set(external_deps))))
+    depstring =  ('[\n%s\t\t]' % format_dep_string([':%s' % jarname] + sorted(set(test_deps + compile_deps)) + sorted(set(external_deps))))
 
     test_resources = []
+    test_resources_exclude = []
     tmp1 = []
     # note that test resources include both 'app' and 'test'
     for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? ORDER BY directory",(group,artifact,)):
         if os.path.exists(os.path.join(homedir,row['directory'])):
-            test_resources.append(row['directory'] + '/' + row['include'])
+            test_resources.append(row['directory'] + '/' + row['include'].strip())
+            if row['exclude']: test_resources_exclude.append(row['exclude'].strip())
             tmp1.append(row['directory'])
     test_resources_root = os.path.normpath(os.path.commonprefix(tmp1))
     if len(tmp1):
-        resource_string = (RESOURCE_PARAM % '\',\''.join(test_resources))
+        resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(test_resources))),'\',\''.join(sorted(set(test_resources_exclude)))))
     if test_resources_root != '':
         resource_root_string = (RESOURCE_ROOT_PARAM % test_resources_root)
-    tmpbuffer += (RULE_TEMPL % (artifact,autodeps,testdir,artifact,resource_string,resource_root_string,depstring,"['PUBLIC']"))
-    # tmpbuffer += (RULE_TEMPL % (artifact,autodeps,testdir,resource_string,resource_root_string,artifact,('[\n' + internal_deps + external_deps + '\t\t]'),"['PUBLIC']"))
+    tmpbuffer += (RULE_TEMPL % (jarname,autodeps,testdir,jarname,resource_string,resource_root_string,depstring,"['PUBLIC']"))
     return tmpbuffer
 
 def maven_dependency(group,artifact,version,classifier,type):
@@ -626,7 +658,7 @@ def maven_dependency(group,artifact,version,classifier,type):
         tmpbuffer += "(name='%s', binary_jar=':%s-%s'," % (artifact,artifact,type)
         tmpbuffer += "visibility = ['PUBLIC',],)\n"
 
-        tmpbuffer += "remote_file(name='%s-%s', url='mvn:%s:%s:%s:%s', sha1='%s',)\n" % (
+        tmpbuffer += "remote_file(name='%s-%s', url='mvn:%s:%s:%s:%s', sha1='%s',)" % (
             artifact,
             type,
             group,

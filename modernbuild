@@ -195,8 +195,8 @@ def walk_workspace_tree():
 
 
     # Create a SQLite db
-    conn = sqlite3.connect('./mvn.db')
-    # conn = sqlite3.connect(':memory:')
+    # conn = sqlite3.connect('./mvn.db')
+    conn = sqlite3.connect(':memory:')
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
@@ -240,9 +240,10 @@ def walk_workspace_tree():
         homedir = homedirfull.replace(cwd,'./').rstrip('/')
 
         (junk,buckalias)=os.path.split(os.path.normpath(homedir))
-        if buckalias!='.':
+        if buckalias=='.':
+            buckconfig.set('alias','it','//:%s' % paid)
+        else:
             buckconfig.set('alias',buckalias,'//%s:%s' % (buckalias,paid))
-            buckaliases.append('//%s' % buckalias)
 
         pappsource = get_text_element(project,'build/sourceDirectory').replace(homedirfull,'./')
         ptstsource = get_text_element(project,'build/testSourceDirectory').replace(homedirfull,'./')
@@ -370,14 +371,18 @@ def walk_workspace_tree():
             thirdparty.write('\n# WARN - Dependency appears to be local, but source not found.')
         thirdparty.write(maven_dependency(row['groupid'],row['artifactid'],row['version'],row['classifier'],row['type']))
     # top-level target so we can just 'buck fetch externals'.
-    biglist = []
+    alltargets = []
     for row in c.execute(EXTERNAL_SQL):
-        biglist.append('//externals:' + row['artifactid'])
+        alltargets.append('//externals:' + row['artifactid'])
     thirdparty.write("\n\n# Rule to ease downloading externals.  But really people, DON'T.  Check them in.")
-    thirdparty.write("\ngenrule(name='externals', cmd='touch $OUT', out='noop.txt', srcs=[\n\t'%s'\n\t],)" % '\',\n\t\''.join(biglist))
+    thirdparty.write("\ngenrule(name='externals', cmd='touch $OUT', out='noop.txt', srcs=[\n\t'%s'\n\t],)" % '\',\n\t\''.join(alltargets))
     thirdparty.close()
 
     # Targets for each of the descendants
+    alltargets = []
+    for project in c.execute("SELECT * FROM project WHERE homedir!='.' ORDER BY rowid" ):
+        alltargets.append(project['homedir'].replace('./','//') + ':' + project['artifactid'])
+
     for project in c.execute("SELECT * FROM project ORDER BY rowid"):
         # 'groupid', 'artifactid', 'version', 'packaging', 'name', 'description', 'pgid', 'paid', 'pversion', 'ppath', 'srcdir', 'testdir']
 
@@ -388,7 +393,10 @@ def walk_workspace_tree():
             os.remove(buildfilepath)
         target = open(buildfilepath,'wr')
         target.write(TARGET_HEADER)
-        target.write('\n' + generate_build_rule(project['groupid'],project['artifactid'],project['packaging'],project['homedir'],project['srcdir'].replace('./',''),project['testdir'].replace('./',''),project['datadir'].replace('./',''),conn))
+        if project['homedir']=='.':
+            target.write("\ngenrule(name='%s', cmd='touch $OUT', out='noop.txt', srcs=[\n\t'%s'\n\t],)" % (project['artifactid'],'\',\n\t\''.join(alltargets)))
+        else:
+            target.write('\n' + generate_build_rule(project['groupid'],project['artifactid'],project['packaging'],project['homedir'],project['srcdir'].replace('./',''),project['testdir'].replace('./',''),project['datadir'].replace('./',''),conn))
         target.close()
 
     conn.close()
@@ -555,7 +563,7 @@ def get_test_dependency_list(group,artifact,c):
 
 def get_provided_dependency_list(group,artifact,c):
     retval = []
-    for row in c.execute("SELECT distinct groupid,artifactid,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?) ORDER BY groupid,artifactid",(group,artifact,'provided')):
+    for row in c.execute("SELECT distinct groupid,artifactid,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?,?) ORDER BY groupid,artifactid",(group,artifact,'provided','system')):
         retval.append({'group': row['groupid'], 'artifact': row['artifactid'], 'version': row['version'],'external': row['external']})
     return retval
 
@@ -658,15 +666,19 @@ def maven_dependency(group,artifact,version,classifier,type):
         tmpbuffer += "(name='%s', binary_jar=':%s-%s'," % (artifact,artifact,type)
         tmpbuffer += "visibility = ['PUBLIC',],)\n"
 
-        tmpbuffer += "remote_file(name='%s-%s', url='mvn:%s:%s:%s:%s', sha1='%s',)" % (
-            artifact,
-            type,
-            group,
-            artifact,
-            type,
-            version,
-            sha1
-        )
+        # Dirty hack until I know the proper solution...
+        if group=='com.sun' and artifact=='tools':
+            tmpbuffer += "genrule( name='tools-jar', out='tools.jar', cmd='cp $JAVA_HOME/lib/tools.jar $OUT')"
+        else:
+            tmpbuffer += "remote_file(name='%s-%s', url='mvn:%s:%s:%s:%s', sha1='%s',)" % (
+                artifact,
+                type,
+                group,
+                artifact,
+                type,
+                version,
+                sha1
+            )
         return tmpbuffer
     except TypeError:
         origgroup = group

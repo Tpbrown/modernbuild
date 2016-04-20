@@ -156,6 +156,12 @@ def get_text_element(pom,tag,default=None):
     except AttributeError:
         return default
 
+last_message=''
+def user_message(msg):
+    global last_message
+    if msg != last_message:
+        print msg
+        last_message=msg
 
 
 FIND_HOMEDIR = "SELECT homedir FROM project where project.groupid=? and project.artifactid=?"
@@ -176,6 +182,13 @@ DEP_INSERT="INSERT INTO dependency VALUES(?,?,?,?,?,?,?,?,?,'')"
 DEP_EXCL_TABLE = "CREATE TABLE 'depexcl' ('ogid' TEXT,'oaid' TEXT, 'groupid' TEXT, 'artifactid' TEXT)"
 DEP_EXCL_INSERT = "INSERT INTO 'depexcl' VALUES(?,?,?,?)"
 
+TEST_EXCL_TABLE = "CREATE TABLE 'testexcl' ('ogid' TEXT,'oaid' TEXT,'exclude' TEXT)"
+TEST_EXCL_INSERT = "INSERT INTO 'testexcl' VALUES(?,?,?)"
+
+BUILD_PROPERTY_TABLE = "CREATE TABLE 'property' ('ogid' TEXT,'oaid' TEXT,'name' TEXT, 'value' TEXT)"
+BUILD_PROPERTY_INSERT = "INSERT INTO 'property' VALUES(?,?,?,?)"
+
+
 def walk_workspace_tree():
     cwd = ''
 
@@ -184,11 +197,17 @@ def walk_workspace_tree():
     buckconfig.add_section('alias')
     buckconfig.add_section('maven_repositories')
     buckconfig.add_section('build')
+    buckconfig.add_section('java')
     buckconfig.set('build','depfiles','cache')
     buckconfig.add_section('project')
     buckconfig.set('project','glob_handler','watchman')
     buckconfig.set('project','build_file_search_method','watchman')
     buckconfig.set('project','parallel_processing','true')
+    buckconfig.add_section('test')
+    buckconfig.set('test','timeout',3000)
+    buckconfig.set('test','rule_timeout', 30000)
+    buckconfig.add_section('ignore')
+    buckconfig.set('ignore','.git,.svn,.hg,**/target')
 
     # String inserted at the top of all BUCK files.  Used to trigger editor language selection.
     TARGET_HEADER = '#!/usr/bin/env python (only used to trigger editor language)\n'
@@ -205,6 +224,8 @@ def walk_workspace_tree():
     c.execute(PROJECT_TABLE)
     c.execute(LICENSE_INSERT_TABLE)
     c.execute(RESOURCE_TABLE)
+    c.execute(TEST_EXCL_TABLE)
+    c.execute(BUILD_PROPERTY_TABLE)
     conn.commit()
 
     print 'Building list of local artifacts (source)'
@@ -215,7 +236,6 @@ def walk_workspace_tree():
         projects = (pom,)
     else:
         projects = pom.findall('project')
-    print len(projects)
 
     buckaliases = []
     for project in projects:
@@ -223,6 +243,8 @@ def walk_workspace_tree():
         depexcl = []
         licenses = []
         resources = []
+        testexcl = []
+        properties = []
         pname = get_text_element(project,'name','')
         pgid = get_text_element(project,'groupId')
         paid = get_text_element(project,'artifactId')
@@ -252,6 +274,7 @@ def walk_workspace_tree():
         pfinalname = get_text_element(project,'build/finalName')
 
 
+
         for filter in project.findall('build/filters/filter'):
             raise Exception("POM build/filters not supported yet.")
 
@@ -267,15 +290,20 @@ def walk_workspace_tree():
             lcomment = get_text_element(license,'comment')
             licenses.append((pgid,paid,lname,lurl,ldist,lcomment,))
 
+        for property in project.find('properties'):
+            properties.append((pgid,paid,property.tag,property.text,))
+
         for resource in project.findall('build/resources/resource'):
             if os.path.exists(get_text_element(resource,'directory')):
                 rtarget = get_text_element(resource,'targetPath')
                 rfiltering = get_text_element(resource,'filtering')
                 rdirectory = os.path.normpath(get_text_element(resource,'directory').replace(homedirfull,'./').rstrip('/'))
-                rincludes = get_text_element(resource,'includes')
+                if (len(resource.findall('includes/include')) > 1) or (len(resource.findall('excludes/exclude')) > 1):
+                    raise Exception("Script only supports a single include and exclude per resource directory.  This is because I'm lazy.")
+                rincludes = get_text_element(resource,'includes/include')
                 if rincludes == None:
                     rincludes = '**/*.*'
-                rexcludes = get_text_element(resource,'excludes')
+                rexcludes = get_text_element(resource,'excludes/exclude')
                 resources.append((pgid,paid,'app',rtarget,rfiltering,rdirectory,rincludes,rexcludes,))
 
         for resource in project.findall('build/testResources/testResource'):
@@ -288,6 +316,16 @@ def walk_workspace_tree():
                     rincludes = '**/*.*'
                 rexcludes = get_text_element(resource,'excludes')
                 resources.append((pgid,paid,'test',rtarget,rfiltering,rdirectory,rincludes,rexcludes,))
+
+        for plugin in project.findall('build/plugins/plugin'):
+            if get_text_element(plugin,'artifactId') == 'maven-surefire-plugin':
+                for exclusion in plugin.findall('configuration/excludes/exclude'):
+                    testexcl.append((pgid,paid,exclusion.text,))
+            if get_text_element(plugin,'artifactId') == 'maven-compiler-plugin':
+                source_level = get_text_element(plugin,'configuration/source')
+                target_level = get_text_element(plugin,'configuration/target')
+                buckconfig.set('java','source_level',source_level)
+                buckconfig.set('java','target_level',target_level)
 
         # Direct dependencies are in the epom.xml
         for dep in project.findall('dependencies/dependency'):
@@ -316,16 +354,21 @@ def walk_workspace_tree():
 
 
         # Project loop indent
+        print("\t%d sub-modules" % len(project.findall('modules/module')))
+        print("\t%d properties" % len(properties))
         print("\t%d licenses" % len(licenses))
         print("\t%d dependencies" % len(deplist))
         print("\t%d dependency exclusions" % len(depexcl))
         print("\t%d resources" % len(resources))
+        print("\t%d test exclusions" % len(testexcl))
 
         c.execute(PROJECT_INSERT,(pgid,paid,pversion,ppackage,pname,pdesc,ppgid,ppaid,ppversion,pppath,pappsource,ptstsource,homedir,datadir))
         c.executemany(LICENSE_INSERT,licenses)
         c.executemany(RESOURCE_INSERT,resources)
         c.executemany(DEP_INSERT,deplist)
         c.executemany(DEP_EXCL_INSERT,depexcl)
+        c.executemany(TEST_EXCL_INSERT,testexcl)
+        c.executemany(BUILD_PROPERTY_INSERT,properties)
         conn.commit()
 
     # Processing non-root POM. Only used to determine paths for buld files.
@@ -342,14 +385,26 @@ def walk_workspace_tree():
     #
 
     # buck configuration
-    # TODO: write a top-level alias that has everything (?)
-    # bigalias = get_text_element(pom,'project/artifactId')
-    # buckconfig.set('alias',bigalias, ' '.join(buckaliases))
+    source_roots = []
+    for row in c.execute('SELECT DISTINCT directory FROM resource'):
+        source_roots.append(os.path.join('/',row['directory']))
+    for row in c.execute('SELECT DISTINCT srcdir FROM project'):
+        source_roots.append(os.path.join('/',row['srcdir']))
+    buckconfig.set('java','src_roots',','.join(sorted(set(source_roots))))
 
     print "\n\nWriting .buckconfig"
     with open('.buckconfig', 'wb') as configfile:
         buckconfig.write(configfile)
-    # write thirdparty depenencies to //externals
+
+    print "Writing build property patterns for for resource filtering to //BUCK-sed"
+    if os.path.exists("./externals/BUCK-sed"):
+        os.remove("./externals/BUCK-sed")
+    sedcommands = open('./BUCK-sed', "w")
+
+    for row in c.execute('SELECT DISTINCT name,value FROM property ORDER BY name'):
+        sedcommands.write('s/\${%s}/%s/\n' % (row['name'],row['value']))
+    sedcommands.close()
+
     print "Writing third party dependencies to //externals"
     if os.path.exists("./externals/BUCK"):
         os.remove("./externals/BUCK")
@@ -409,9 +464,6 @@ def generate_build_rule(group,artifact,type,homedir,srcdir,testdir,datadir,conn)
 
     c = conn.cursor()
     if type == 'jar':
-        # TODO - resources for tests
-        (resource_string,resource_root_string) = get_resource_param_strings(group,artifact,homedir,'app',conn)
-
         tmpbuffer = generate_jar(artifact,group,artifact,homedir,srcdir,testdir,conn)
     elif type=='war':
         # Makeing things cleaner.  Create a variable that contains all dependencies in the rule.
@@ -446,6 +498,8 @@ def generate_build_rule(group,artifact,type,homedir,srcdir,testdir,datadir,conn)
     c.close()
     return tmpbuffer
 
+RESOURCE_PARAM='glob([\'%s\'], excludes=[\'%s\'])'
+RESOURCE_ROOT_PARAM='resources_root=\'%s\',\n\t'
 def get_resource_param_strings(group,artifact,homedir,restype,conn):
     # Type: 'app', 'test', or 'webapp' (special case)
     c=conn.cursor()
@@ -454,8 +508,10 @@ def get_resource_param_strings(group,artifact,homedir,restype,conn):
     tmp1 = []
     resource_string='[]'
     resource_root_string=''
-    for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type='app' ORDER BY directory",(group,artifact,)):
+    filter_warning = ''
+    for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type=? ORDER BY directory",(group,artifact,restype)):
         if os.path.exists(os.path.join(homedir,row['directory'])):
+            if row['filtering']=='true': filter_warning = "\n# WARN: Resource filtering not active\n"
             resources.append(row['directory'] + '/' + row['include'].strip())
             if row['exclude']: resource_excludes.append(row['exclude'].strip())
             tmp1.append(row['directory'])
@@ -463,11 +519,9 @@ def get_resource_param_strings(group,artifact,homedir,restype,conn):
     if len(tmp1):
         resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(resources))),'\',\''.join(sorted(set(resource_excludes))).strip()))
     if resources_root != '':
-        resource_root_string = (RESOURCE_ROOT_PARAM % resources_root)
+        resource_root_string = (RESOURCE_ROOT_PARAM % resources_root) + filter_warning
     return (resource_string,resource_root_string)
 
-RESOURCE_PARAM='glob([\'%s\'], excludes=[\'%s\'])'
-RESOURCE_ROOT_PARAM='resources_root=\'%s\',\n\t'
 JAVA_LIBRARY_RULE_TEMPL = "java_library(\n\tname='%s',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tresources=%s,\n\t%sdeps=%s,\n\tprovided_deps=%s,\n\texported_deps=%s,\n\ttests=[%s],\n\tvisibility=%s,\n\t)"
 def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=True):
     tmpbuffer = ''
@@ -541,8 +595,11 @@ def get_grouped_dependencies(group,artifact,scope,conn):
             external.append(('//externals:%s' % dep['artifact']).encode('ascii','ignore'))
         else:
             dep2 = c.execute(FIND_HOMEDIR,(dep['group'],dep['artifact'],)).fetchone()
+            if dep2 == None and dep['artifact'].endswith('-test'):
+                # test-jars have -test appended.  Try again without -test.
+                dep2 = c.execute(FIND_HOMEDIR,(dep['group'],dep['artifact'][:-len('-test')],)).fetchone()
             if dep2 == None:
-                print "WARN: %s:%s appears to be a local artifact, but is being treaded as a [binary] external." % (group,artifact)
+                user_message("WARN: %s:%s appears to be a local artifact, but is being treaded as a [binary] external." % (dep['group'],dep['artifact']))
                 external.append(('//externals:%s' % dep['artifact']).encode('ascii','ignore'))
             else:
                 internal.append(('%s:%s' % (dep2['homedir'].replace('./','//'),dep['artifact'])).encode('ascii','ignore'))
@@ -551,14 +608,20 @@ def get_grouped_dependencies(group,artifact,scope,conn):
 
 def get_compile_dependency_list(group,artifact,c):
     retval = []
-    for row in c.execute("SELECT distinct groupid,artifactid,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?,?) ORDER BY groupid,artifactid",(group,artifact,'compile','runtime')):
-        retval.append({'group': row['groupid'], 'artifact': row['artifactid'], 'version': row['version'],'external': row['external']})
+    for row in c.execute("SELECT distinct groupid,artifactid,type,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?,?) ORDER BY groupid,artifactid",(group,artifact,'compile','runtime')):
+        artifactid = row['artifactid']
+        # test-jars map to our "-test" rules.
+        if row['type']=='test-jar': artifactid+='-test'
+        retval.append({'group': row['groupid'], 'artifact': artifactid, 'version': row['version'],'external': row['external']})
     return retval
 
 def get_test_dependency_list(group,artifact,c):
     retval = []
-    for row in c.execute("SELECT distinct groupid,artifactid,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?) ORDER BY groupid,artifactid",(group,artifact,'test')):
-        retval.append({'group': row['groupid'], 'artifact': row['artifactid'], 'version': row['version'],'external': row['external']})
+    for row in c.execute("SELECT distinct groupid,artifactid,type,version,external FROM dependency WHERE ogid=? AND oaid=? AND scope in (?) ORDER BY groupid,artifactid",(group,artifact,'test')):
+        artifactid = row['artifactid']
+        # test-jars map to our "-test" rules.
+        if row['type']=='test-jar': artifactid+='-test'
+        retval.append({'group': row['groupid'], 'artifact': artifactid, 'version': row['version'],'external': row['external']})
     return retval
 
 def get_provided_dependency_list(group,artifact,c):
@@ -620,10 +683,11 @@ def get_dependency_tree(filepath,conn):
     return
 
 def generate_java_test(jarname,group,artifact,homedir,testdir,conn):
-    RULE_TEMPL = "java_test(\n\tname='%s-test',\n\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tsource_under_test=[':%s'],\n\tresources=%s,\n\t%sdeps=%s,\n\tvisibility=%s,\n\t)\n"
+    RULE_TEMPL = "java_test(\n\tname='%s-test',\n\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java'], excludes=['%s']),\n\tsource_under_test=[':%s'],\n\tresources=%s,\n\t%sdeps=%s,\n\tvisibility=%s,\n\t)\n"
     tmpbuffer = ''
     testrule = ''
     resource_string= '[]'
+    test_excl_string = '[]'
     c = conn.cursor()
 
     (dirname,targetname) = os.path.split(homedir)
@@ -639,18 +703,30 @@ def generate_java_test(jarname,group,artifact,homedir,testdir,conn):
     test_resources = []
     test_resources_exclude = []
     tmp1 = []
+
+
+
     # note that test resources include both 'app' and 'test'
-    for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? ORDER BY directory",(group,artifact,)):
-        if os.path.exists(os.path.join(homedir,row['directory'])):
-            test_resources.append(row['directory'] + '/' + row['include'].strip())
-            if row['exclude']: test_resources_exclude.append(row['exclude'].strip())
-            tmp1.append(row['directory'])
-    test_resources_root = os.path.normpath(os.path.commonprefix(tmp1))
-    if len(tmp1):
-        resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(test_resources))),'\',\''.join(sorted(set(test_resources_exclude)))))
-    if test_resources_root != '':
-        resource_root_string = (RESOURCE_ROOT_PARAM % test_resources_root)
-    tmpbuffer += (RULE_TEMPL % (jarname,autodeps,testdir,jarname,resource_string,resource_root_string,depstring,"['PUBLIC']"))
+    # for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? ORDER BY directory",(group,artifact,)):
+    #     if os.path.exists(os.path.join(homedir,row['directory'])):
+    #         test_resources.append(row['directory'] + '/' + row['include'].strip())
+    #         if row['exclude']: test_resources_exclude.append(row['exclude'].strip())
+    #         tmp1.append(row['directory'])
+    # test_resources_root = os.path.normpath(os.path.commonprefix(tmp1))
+
+    (resource_string,resource_root_string) = get_resource_param_strings(group,artifact,homedir,'test',conn)
+
+    # if len(tmp1):
+    # resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(test_resources))),'\',\''.join(sorted(set(test_resources_exclude)))))
+    # if test_resources_root != '':
+    #     resource_root_string = (RESOURCE_ROOT_PARAM % test_resources_root)
+
+    test_excludes = []
+    tmp1 = []
+    for row in c.execute("SELECT DISTINCT exclude FROM testexcl WHERE testexcl.ogid=? AND testexcl.oaid=? ORDER BY exclude",(group,artifact,)):
+        test_excludes.append(row['exclude'].strip())
+
+    tmpbuffer += (RULE_TEMPL % (jarname,autodeps,testdir,'\',\''.join(sorted(test_excludes)),jarname,resource_string,resource_root_string,depstring,"['PUBLIC']"))
     return tmpbuffer
 
 def maven_dependency(group,artifact,version,classifier,type):

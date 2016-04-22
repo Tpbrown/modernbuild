@@ -156,12 +156,14 @@ def get_text_element(pom,tag,default=None):
     except AttributeError:
         return default
 
-last_message=''
-def user_message(msg):
+last_message=['']
+def user_message(msg,reset=False):
     global last_message
-    if msg != last_message:
+    if reset:
+        last_message=['']
+    if msg not in last_message:
         print msg
-        last_message=msg
+        last_message.append(msg)
 
 
 FIND_HOMEDIR = "SELECT homedir FROM project where project.groupid=? and project.artifactid=?"
@@ -189,6 +191,17 @@ BUILD_PROPERTY_TABLE = "CREATE TABLE 'property' ('ogid' TEXT,'oaid' TEXT,'name' 
 BUILD_PROPERTY_INSERT = "INSERT INTO 'property' VALUES(?,?,?,?)"
 
 
+def is_supported(group,plugin):
+    supported = 0
+    if group == '(core)' and plugin=='maven-compiler-plugin': supported=2
+    elif group == '(core)' and plugin=='maven-resources-plugin': supported=1
+    elif group == 'maven-surefire-plugin': supported=1
+
+    if supported==2: return "supported"
+    if supported==1: return "partial support"
+    if supported==0: return "no support"
+    return ""
+
 def walk_workspace_tree():
     cwd = ''
 
@@ -214,8 +227,8 @@ def walk_workspace_tree():
 
 
     # Create a SQLite db
-    # conn = sqlite3.connect('./mvn.db')
-    conn = sqlite3.connect(':memory:')
+    conn = sqlite3.connect('./mvn.db')
+    # conn = sqlite3.connect(':memory:')
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
@@ -228,7 +241,6 @@ def walk_workspace_tree():
     c.execute(BUILD_PROPERTY_TABLE)
     conn.commit()
 
-    print 'Building list of local artifacts (source)'
     pom = initXML(os.path.normpath('./epom.xml'))
 
     # an epom of a project with no children has a root tag of 'project', not 'projects'. We need to handle both
@@ -236,6 +248,18 @@ def walk_workspace_tree():
         projects = (pom,)
     else:
         projects = pom.findall('project')
+
+    # Provide a list of plugins in used
+    plugin_list=[]
+    print "Maven plugins in use:"
+    for plugin in pom.findall('project/build/plugins/plugin'):
+        plugin_group=get_text_element(plugin,'groupId','(core)')
+        plugin_artifact=get_text_element(plugin,'artifactId')
+        plugin_list.append('%s:\t%s:%s' % (is_supported(plugin_group,plugin_artifact),plugin_group,plugin_artifact))
+    for plugin in sorted(set(plugin_list)):
+        print "\t",plugin
+    print "\n"
+    print 'Building list of local artifacts (source)'
 
     buckaliases = []
     for project in projects:
@@ -248,7 +272,8 @@ def walk_workspace_tree():
         pname = get_text_element(project,'name','')
         pgid = get_text_element(project,'groupId')
         paid = get_text_element(project,'artifactId')
-        print("Reading project %s (%s:%s)" % (pname,pgid,paid))
+        last_message=[]
+        print("\nReading project %s (%s:%s)" % (pname,pgid,paid))
 
         pversion = get_text_element(project,'version')
         ppackage = get_text_element(project,'packaging','jar')
@@ -305,6 +330,8 @@ def walk_workspace_tree():
                     rincludes = '**/*.*'
                 rexcludes = get_text_element(resource,'excludes/exclude')
                 resources.append((pgid,paid,'app',rtarget,rfiltering,rdirectory,rincludes,rexcludes,))
+            else:
+                print "dir doesnt exist",get_text_element(resource,'directory')
 
         for resource in project.findall('build/testResources/testResource'):
             if os.path.exists(get_text_element(resource,'directory')):
@@ -316,6 +343,8 @@ def walk_workspace_tree():
                     rincludes = '**/*.*'
                 rexcludes = get_text_element(resource,'excludes')
                 resources.append((pgid,paid,'test',rtarget,rfiltering,rdirectory,rincludes,rexcludes,))
+            else:
+                print "dir doesnt exist",get_text_element(resource,'directory')
 
         for plugin in project.findall('build/plugins/plugin'):
             if get_text_element(plugin,'artifactId') == 'maven-surefire-plugin':
@@ -326,6 +355,28 @@ def walk_workspace_tree():
                 target_level = get_text_element(plugin,'configuration/target')
                 buckconfig.set('java','source_level',source_level)
                 buckconfig.set('java','target_level',target_level)
+
+            if get_text_element(plugin,'artifactId') == 'maven-war-plugin':
+                for resource in plugin.findall('configuration/webResources/resource'):
+                    if os.path.exists(os.path.join(homedir,get_text_element(resource,'directory'))):
+                        rtarget = get_text_element(resource,'targetPath')
+                        rfiltering = get_text_element(resource,'filtering')
+                        rdirectory = os.path.normpath(get_text_element(resource,'directory').replace(homedirfull,'./').rstrip('/'))
+                        rincludes = []
+                        rexcludes = []
+                        for include in resource.findall('includes/include'):
+                            rincludes.append(include.text)
+                        for exclude in resource.findall('excludes/exclude'):
+                            rexcludes.append(exclude.text)
+                        if rincludes == None:
+                            rincludes = ['**/*.*']
+                        for include in rincludes:
+                            resources.append((pgid,paid,'web',rtarget,rfiltering,rdirectory,include,None,))
+                        for exclude in rexcludes:
+                            resources.append((pgid,paid,'web',rtarget,rfiltering,rdirectory,None,exclude,))
+                    else:
+                        print "dir doesnt exist",get_text_element(resource,'directory')
+
 
         # Direct dependencies are in the epom.xml
         for dep in project.findall('dependencies/dependency'):
@@ -396,13 +447,17 @@ def walk_workspace_tree():
     with open('.buckconfig', 'wb') as configfile:
         buckconfig.write(configfile)
 
-    print "Writing build property patterns for for resource filtering to //BUCK-sed"
+    print "Writing build property patterns for resource filtering to //BUCK-sed"
     if os.path.exists("./externals/BUCK-sed"):
         os.remove("./externals/BUCK-sed")
     sedcommands = open('./BUCK-sed', "w")
 
     for row in c.execute('SELECT DISTINCT name,value FROM property ORDER BY name'):
-        sedcommands.write('s/\${%s}/%s/\n' % (row['name'],row['value']))
+        if row['value']:
+            value = row['value'].replace('/','\/')
+        else:
+            value = ''
+        sedcommands.write('s/\${%s}/%s/\n' % (row['name'],value))
     sedcommands.close()
 
     print "Writing third party dependencies to //externals"
@@ -443,7 +498,7 @@ def walk_workspace_tree():
 
         # print project.rowid
         buildfilepath = os.path.join(project['homedir'],'BUCK')
-        print "Writing buildfile",buildfilepath
+        user_message("Writing buildfile %s" % buildfilepath,True)
         if os.path.exists(buildfilepath):
             os.remove(buildfilepath)
         target = open(buildfilepath,'wr')
@@ -468,23 +523,52 @@ def generate_build_rule(group,artifact,type,homedir,srcdir,testdir,datadir,conn)
     elif type=='war':
         # Makeing things cleaner.  Create a variable that contains all dependencies in the rule.
         (internal_deps, external_deps) = get_grouped_dependencies(group,artifact,'compile',conn)
-        tmpbuffer += "\n\nWAR_DEPS=[\n%s]\n\n" % (format_dep_string(sorted(internal_deps) + sorted(external_deps)))
+        tmpbuffer += "WAR_DEPS=[\n%s]\n\n" % (format_dep_string(sorted(internal_deps) + sorted(external_deps)))
 
-        # Final WAR (webapps folder + remapped classess + remapped jars)
-        tmpbuffer += ("zip_file(name='%s',out='%s.war', srcs=[':%s.webapp-sources',':%s.classes',':%s.libs'],visibility=['PUBLIC'],)\n" % (artifact,artifact,artifact,artifact,artifact))
+        # Final WAR (webapps folder + remapped classess (if found) + remapped jars)
+        srcs_string="[':%s.webapp-sources',':%s.classes',':%s.libs']" % (artifact,artifact,artifact)
+        skip_war_jar=False
+        if not os.path.exists(os.path.join(homedir,srcdir)):
+            # If there's no Java source in the WAR project itself then simplify the rules we produce...
+            srcs_string="[':%s.webapp-sources',':%s.libs']" % (artifact,artifact)
+            skip_war_jar=True
+
         # Contents of webapps dir
-        tmpbuffer += ("java_library(name='%s.webapp-sources',resources=glob(['%s/**/*.*']),resources_root='%s',)\n" % (artifact,datadir,datadir))
-        # java_library() to compile any source in the WAR itself
-        tmpbuffer += generate_jar(artifact+'.classes-sources',group,artifact,homedir,srcdir,testdir,conn,False)
+        resource_string = "[]"
+        resource_root_string=''
+        (filtering_active, resources_root, dirlist,unfiltered_resources, unfiltered_resource_excludes,filtered_resources, filtered_resource_excludes) = get_resource_list(group,artifact,homedir,'app',conn)
+
+        # WAR with dependencies and any unfiltered resources
+        if len(unfiltered_resources):
+            resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(unfiltered_resources))),'\',\''.join(sorted(set(unfiltered_resource_excludes))).strip()))
+            srcs_string = resource_string + '+' + srcs_string
+        tmpbuffer += ("zip_file(name='%s',out='%s.war', srcs=%s, visibility=['PUBLIC'],)\n" % (artifact,artifact,srcs_string))
+
+        exported_deps=[]
+        if len(filtered_resources):
+            exported_deps=[':%s.webapp-sources-resources' % artifact]
+            resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(filtered_resources))),'\',\''.join(sorted(set(filtered_resource_excludes))).strip()))
+            # if resources_root != '':
+            resource_root_string = (RESOURCE_ROOT_PARAM % resources_root)
+            tmpbuffer += generate_resource_preprocessing_rules(artifact+'.webapp-sources',resource_string,resources_root)
+            resource_string = "[]"
+            resource_root_string=''
+
+        tmpbuffer += ("java_library(name='%s.webapp-sources',resources=glob(['%s/**/*.*']),resources_root='%s', exported_deps=[%s])\n" % (artifact,datadir,datadir,format_dep_string(exported_deps).strip()))
+
         # Zip file of all JAR dependencies
         tmpbuffer += ("zip_file(name='%s.jars', srcs=WAR_DEPS,)\n" % (artifact))
-        # Zip file of this modules java_library, remapped into WEB-INF/classes
-        tmpbuffer += ("genrule(name='%s.classes',\n" % artifact)
-        tmpbuffer += ("\tcmd = 'mkdir -p WEB-INF/classes;unzip $(location :%s.classes-sources) -d WEB-INF/classes;zip -r $OUT WEB-INF',\n" % artifact)
-        tmpbuffer += ("\tout = '%s_classes.src.zip'\n\t)\n" % artifact)
+        if not skip_war_jar:
+            # java_library() to compile any source in the WAR itself
+            tmpbuffer += generate_jar(artifact+'.classes-sources',group,artifact,homedir,srcdir,testdir,conn,False)
+            # Zip file of this modules java_library, remapped into WEB-INF/classes
+            tmpbuffer += ("genrule(name='%s.classes',\n" % artifact)
+            tmpbuffer += ("\tcmd = 'rm -f $OUT&&mkdir -p WEB-INF/classes&&unzip -qo $(location :%s.classes-sources) -d WEB-INF/classes&&zip -Dr $OUT WEB-INF',\n" % artifact)
+            tmpbuffer += ("\tout = '%s_classes.src.zip'\n\t)\n" % artifact)
+
         # Zip file of all JAR dependencies, remapped into WEB-INF/lib
         tmpbuffer += ("genrule(name='%s.libs',\n" % artifact)
-        tmpbuffer += ("\tcmd = 'mkdir -p WEB-INF/lib;unzip -j $(location :%s.jars) -d WEB-INF/lib;zip -r $OUT WEB-INF',\n" % artifact)
+        tmpbuffer += ("\tcmd = 'rm -f $OUT&&mkdir -p WEB-INF/lib&&unzip -qoj $(location :%s.jars) -d WEB-INF/lib&&zip -Dr $OUT WEB-INF',\n" % artifact)
         tmpbuffer += ("\tout = '%s.libs.src.zip'\n\t)\n" % artifact)
     elif type=='pom':
         # Aggregate type.   Write out a no-op rule so that we can pull in the dependencies instead.
@@ -500,26 +584,43 @@ def generate_build_rule(group,artifact,type,homedir,srcdir,testdir,datadir,conn)
 
 RESOURCE_PARAM='glob([\'%s\'], excludes=[\'%s\'])'
 RESOURCE_ROOT_PARAM='resources_root=\'%s\',\n\t'
-def get_resource_param_strings(group,artifact,homedir,restype,conn):
-    # Type: 'app', 'test', or 'webapp' (special case)
+def get_resource_list(group,artifact,homedir,restype,conn):
     c=conn.cursor()
-    resources = []
-    resource_excludes=[]
-    tmp1 = []
-    resource_string='[]'
-    resource_root_string=''
-    filter_warning = ''
+    unfiltered_resources = []
+    unfiltered_resource_excludes=[]
+    filtered_resources = []
+    filtered_resource_excludes=[]
+    dirlist = []
+    filtering = False
+
     for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type=? ORDER BY directory",(group,artifact,restype)):
         if os.path.exists(os.path.join(homedir,row['directory'])):
-            if row['filtering']=='true': filter_warning = "\n# WARN: Resource filtering not active\n"
-            resources.append(row['directory'] + '/' + row['include'].strip())
-            if row['exclude']: resource_excludes.append(row['exclude'].strip())
-            tmp1.append(row['directory'])
-    resources_root = os.path.commonprefix(tmp1)
-    if len(tmp1):
+            if row['filtering'] == 'true':
+                filtering=True
+                filtered_resources.append(row['directory'] + '/' + row['include'].strip())
+                if row['exclude']:
+                    filtered_resource_excludes.append(os.path.join(row['directory'],row['exclude'].strip()))
+            else:
+                unfiltered_resources.append(row['directory'] + '/' + row['include'].strip())
+                if row['exclude']:
+                    unfiltered_resource_excludes.append(os.path.join(row['directory'],row['exclude'].strip()))
+            dirlist.append(row['directory'])
+    # TODO - do we need two roots?
+    resources_root = os.path.commonprefix(dirlist)
+
+    return (filtering,resources_root,dirlist, unfiltered_resources, unfiltered_resource_excludes, filtered_resources, filtered_resource_excludes)
+
+def get_resource_param_strings(group,artifact,homedir,restype,conn):
+    resource_string='[]'
+    resource_root_string=''
+    (filtering_active, resources_root, dirlist, unfiltered_resources, unfiltered_resource_excludes, filtered_resources, filtered_resource_excludes) = get_resource_list(group,artifact,homedir,restype,conn)
+    # TODO: See if we need these split out
+    resources = unfiltered_resources + filtered_resources
+    resource_excludes = unfiltered_resource_excludes + filtered_resource_excludes
+    if len(dirlist):
         resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(resources))),'\',\''.join(sorted(set(resource_excludes))).strip()))
     if resources_root != '':
-        resource_root_string = (RESOURCE_ROOT_PARAM % resources_root) + filter_warning
+        resource_root_string = (RESOURCE_ROOT_PARAM % resources_root)
     return (resource_string,resource_root_string)
 
 JAVA_LIBRARY_RULE_TEMPL = "java_library(\n\tname='%s',\n#\tautodeps=%s,\n\tsrcs=glob(['%s/**/*.java']),\n\tresources=%s,\n\t%sdeps=%s,\n\tprovided_deps=%s,\n\texported_deps=%s,\n\ttests=[%s],\n\tvisibility=%s,\n\t)"
@@ -531,14 +632,6 @@ def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=T
     c = conn.cursor()
 
     (dirname,targetname) = os.path.split(homedir)
-    map_target = False
-    if map_target and jarname != targetname:
-        message = "# WARN: target/directory name name (%s) does not match artifact name (%s).\n" % (targetname,jarname)
-        print message
-        # map the damn rules together so it feels more like it should.. (better yet - rename the damn directory)
-        tmpbuffer += message + '# Creating a rule that matches the target name.  This is a hack. Rename your directory.\n'
-        tmpbuffer += "prebuilt_jar(name='%s',deps=[':%s'],binary_jar=':%s')\n\n" % (targetname,jarname,jarname)
-
     autodeps = True
     exported_deps=[]
 
@@ -556,12 +649,19 @@ def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=T
     resource_string='[]'
     resource_excludes_string='[]'
     resource_root_string=''
+    filtering = False
+
+    # (resource_string,resource_root_string) = get_resource_param_strings(group,artifact,homedir,'app',conn)
+
     for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? and type='app' ORDER BY directory",(group,artifact,)):
+        if row['filtering'] == 'true': filtering=True
         if os.path.exists(os.path.join(homedir,row['directory'])):
             app_resources.append(row['directory'] + '/' + row['include'].strip())
             if row['exclude']: app_resources_exclude.append(row['exclude'].strip())
             tmp1.append(row['directory'])
+
     app_resources_root = os.path.commonprefix(set(tmp1))
+
     if len(tmp1):
         resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(app_resources))).strip(),'\',\''.join(sorted(set(app_resources_exclude))).strip()))
 
@@ -573,10 +673,42 @@ def generate_jar(jarname,group,artifact,homedir,srcdir,testdir,conn,map_target=T
         testrulename = '\':' + artifact + '-test\''
         tmptestbuffer += generate_java_test(jarname,group,artifact,homedir,testdir,conn)
 
-    tmpbuffer += (JAVA_LIBRARY_RULE_TEMPL % (jarname,autodeps,srcdir,resource_string,resource_root_string,('[\n' + format_dep_string(sorted(set(compile_deps))) + '\t\t]'),('[\n' + format_dep_string(sorted(set(provided_deps))) + '\t\t]'),('[\n' + format_dep_string(sorted(set(exported_deps)))+ '\t\t]'), testrulename,"['PUBLIC']"))
+    compile_deps=sorted(set(compile_deps))
+    provided_deps=sorted(set(provided_deps))
+    exported_deps=sorted(set(exported_deps))
+
+    if filtering:
+        # Write rules to preprocess resources
+        # Filtered resources are in an external Jar.  Exported as a transitive dependency. Top of list for visibility.
+        exported_deps.insert(0,':%s-resources' % jarname)
+        tmpbuffer += generate_resource_preprocessing_rules(jarname,resource_string,app_resources_root)
+        resource_string = "[]"
+        resource_root_string=''
+
+    tmpbuffer += (JAVA_LIBRARY_RULE_TEMPL % (jarname,autodeps,srcdir,resource_string,resource_root_string,('[\n' + format_dep_string(compile_deps) + '\t\t]'),('[\n' + format_dep_string(provided_deps) + '\t\t]'),('[\n' + format_dep_string(exported_deps)+ '\t\t]'), testrulename,"['PUBLIC']"))
     tmpbuffer += ('\n\n' + tmptestbuffer)
 
     return tmpbuffer
+
+REPLACE_RESOURCE_TOKENS='rm -f $OUT&&unzip -oq ${SRCS} -d `dirname $OUT`/filtered&&find `dirname $OUT`/filtered -type f |LC_ALL=C xargs sed -f `buck root`/BUCK-sed -i \"\"&&cd `dirname $OUT`/filtered/%s&&zip -rD $OUT .'
+REMOVE_RESOURCE_ROOT='rm -f $OUT&&unzip -oq ${SRCS} -d `dirname $OUT`/bare&&cd `dirname $OUT`/bare/%s&&zip -rD $OUT .'
+def generate_resource_preprocessing_rules(name,resource_glob,resources_root):
+    retval = ''
+    retval = "# Resources: 'RAW' are those that need to have tokens replaced. 'BARE' are those that don't. 'FINAL' are processed 'RAW'.  FINAL + BARE are what are consumed.\n"
+    # TOKENIZE, BARE
+    # TOKENIZE-FINAL, BARE-FINAL
+    # FINAL = tokenized (if applicable) and flattened resources
+    retval += "# Bare resources.  Just drop the resource root structure.\n"
+    retval += "zip_file(name='%s-bare-resources', srcs=%s),\n" % (name,resource_glob)
+    retval += "genrule(\n\tname='%s-bare-resources-final',\n\tsrcs=[':%s-bare-resources',],\n\tcmd='%s',\n\tout='%s-bare-resources.jar',\n\t)\n" % (name,name,(REMOVE_RESOURCE_ROOT % resources_root),name)
+
+    retval += "# Gather all resources that could have tokens replaced then process with sed.\n"
+    retval += "zip_file(name='%s-tokenize-resources', srcs=%s),\n" % (name,resource_glob)
+    retval += "genrule(\n\tname='%s-tokenize-resources-final',\n\tsrcs=[':%s-tokenize-resources',],\n\tcmd='%s',\n\tout='%s-resources.jar',\n\t)\n" % (name,name,(REPLACE_RESOURCE_TOKENS % resources_root),name)
+
+    retval += "# Define a resource jar that is an exported dependency of the class jar.\n"
+    retval += "prebuilt_jar(name='%s-resources', binary_jar=':%s-tokenize-resources-final')\n\n" % (name,name)
+    return retval
 
 def format_dep_string(mylist):
     retval = ''
@@ -599,7 +731,7 @@ def get_grouped_dependencies(group,artifact,scope,conn):
                 # test-jars have -test appended.  Try again without -test.
                 dep2 = c.execute(FIND_HOMEDIR,(dep['group'],dep['artifact'][:-len('-test')],)).fetchone()
             if dep2 == None:
-                user_message("WARN: %s:%s appears to be a local artifact, but is being treaded as a [binary] external." % (dep['group'],dep['artifact']))
+                user_message("WARN: %s:%s - groupId reflects a source origination but is a prebuilt jar." % (dep['group'],dep['artifact']))
                 external.append(('//externals:%s' % dep['artifact']).encode('ascii','ignore'))
             else:
                 internal.append(('%s:%s' % (dep2['homedir'].replace('./','//'),dep['artifact'])).encode('ascii','ignore'))
@@ -704,22 +836,7 @@ def generate_java_test(jarname,group,artifact,homedir,testdir,conn):
     test_resources_exclude = []
     tmp1 = []
 
-
-
-    # note that test resources include both 'app' and 'test'
-    # for row in c.execute("SELECT DISTINCT directory,targetpath,filtering,include,exclude FROM resource WHERE resource.ogid=? AND resource.oaid=? ORDER BY directory",(group,artifact,)):
-    #     if os.path.exists(os.path.join(homedir,row['directory'])):
-    #         test_resources.append(row['directory'] + '/' + row['include'].strip())
-    #         if row['exclude']: test_resources_exclude.append(row['exclude'].strip())
-    #         tmp1.append(row['directory'])
-    # test_resources_root = os.path.normpath(os.path.commonprefix(tmp1))
-
     (resource_string,resource_root_string) = get_resource_param_strings(group,artifact,homedir,'test',conn)
-
-    # if len(tmp1):
-    # resource_string = (RESOURCE_PARAM % ('\',\''.join(sorted(set(test_resources))),'\',\''.join(sorted(set(test_resources_exclude)))))
-    # if test_resources_root != '':
-    #     resource_root_string = (RESOURCE_ROOT_PARAM % test_resources_root)
 
     test_excludes = []
     tmp1 = []

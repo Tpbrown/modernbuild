@@ -1,0 +1,29 @@
+java_test(
+  name='{{ modulename }}-test',
+  autodeps=True,
+  {{ 'autodeps=True' if enable_autodeps -}}
+  {% if testdir -%}
+  srcs=glob(['{{ testdir }}/**/*.*'], excludes=[{% for excl in test_excludes %}'{{ excl }}',{% endfor %}]),
+  {% endif -%}
+  source_under_test=[':{{ modulename }}'],
+  {% if resources[0].patternlist -%}
+  resources=glob([{% for pattern in resources[0].patternlist %}'{{ pattern }}',{% endfor %}], excludes=['']),
+  {% if droppath %}resources_root='{{ droppath }}',{%- endif %}
+  {% endif -%}
+  {% if compile -%}
+  deps=[
+  ':{{ modulename }}',
+  {%- for dep in compile %}
+  '{{ dep }}',{% endfor %}],
+  {% endif -%}{% if provided %}
+  provided_deps=[{% for dep in provided %}
+  '{{ dep }}',{% endfor %}],
+  {% endif -%}{% if exported %}
+  exported_deps=[{% for dep in exported %}
+  '{{ dep }}',{% endfor %}],
+  {% endif -%}
+  vm_args=[{% for arg in vm_args -%}
+  '{{ arg }}',
+  {%- endfor %}],
+	visibility={{ visibility or "['PUBLIC']" }},
+)

@@ -1,0 +1,8 @@
+{% for name,source,target in resources %}
+genrule(
+	name='{{ name }}',
+	srcs=glob(['{{ source }}']),
+	cmd='mkdir -p \$(dirname $OUT)&&cp $SRCS $OUT&&LC_ALL=C sed -f `buck root`/BUCK-sed -i "" $OUT',
+	out='{{ target }}',
+)
+{% endfor %}

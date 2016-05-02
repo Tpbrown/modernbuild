@@ -1,0 +1,23 @@
+{% for resource in resources %}
+{% if resource.patternlist -%}
+
+{{ '# "bare" resources do not contain tokens, but do need processed to drop "%s" from the path structure.' % droppath if resource.group=='bare' }}
+{{ '# "tokenize" resources need tokens replaced and "%s" dropped from the path structure.' % droppath if resource.group=='tokenize' }}
+zip_file(
+  name='{{ modulename }}-{{ resource.group }}-resources',
+  out='{{ modulename }}-{{ resource.group }}-resources.src.zip',
+  srcs=glob([{% for pattern in resource.patternlist %}{{ ',' if not loop.first }}'{{ pattern }}'{% endfor %}]{% if resource.excludelist %}, excludes=[{% for exclude in resource.excludelist %}'{{ exclude }}',{% endfor %}]{% endif %}){% if targetlist %}+[{% for target in targetlist %}'{{ target }}',{% endfor %}]{% endif %},
+)
+
+genrule(
+	name='{{ modulename }}-{{ resource.group }}-resources-final',
+	srcs=[':{{ modulename }}-{{ resource.group }}-resources',],
+	cmd='rm -f $OUT&&rm -rf $OUT-{{ resource.group }}&&unzip -oq ${SRCS} -d $OUT-{{ resource.group }}&&{% if filtering %}&&find $OUT-{{ resource.group }} -type f |LC_ALL=C xargs sed -f `buck root`/BUCK-sed -i ""&&{% endif %}cd $OUT-{{ resource.group }}/{{ droppath }}&&zip -rD $OUT .',
+	out='{{ modulename }}-{{ resource.group }}.src.zip',
+)
+{% endif %}
+{% endfor %}
+# this rule aggregates any bare or tokenized resources.  It also ensures the date stamps in the resulting jar are correct.
+zip_file(name='{{ modulename }}-resources-all', out='{{ modulename }}-resources-sources.jar', srcs=[{% for resource in resources %}{{ '\':%s-%s-resources-final\',' % (modulename,resource.group) if resource.patternlist}}{% endfor %}],)
+# this rule now allows us to put this jar on a Buck classpath, and should be referenced as an exported dependency.
+prebuilt_jar(name='{{ modulename }}-resources', binary_jar=':{{ modulename }}-resources-all',)

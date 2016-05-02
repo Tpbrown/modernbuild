@@ -1,0 +1,43 @@
+
+WAR_DEPS=[
+  # Internal dependencies
+  {%- for dep in internal_deps %}
+          '{{ dep }}',
+  {%- endfor %}
+  # External dependencies
+  {%- for dep in external_deps %}
+          '{{ dep }}',
+  {%- endfor %}
+]
+
+zip_file(name='{{ modulename }}',out='{{ modulename }}.war', srcs=[':{{ modulename }}.webapp-sources',':{{ modulename }}.classes',':{{ modulename }}.libs'],visibility=['PUBLIC'],)
+java_library(name='{{ modulename }}.webapp-sources',resources=glob(['{{ webappdir }}/**/*.*']),resources_root='{{ webappdir }}',)
+
+java_library(
+	name='{{ modulename }}.classes-sources',
+	{{ 'srcs=glob([\'%s/**/*.java\']),' % srcdir if srcdir }}
+  resources=glob([{% for pattern in resources[0].patternlist %}'{{ pattern }}',{% endfor %}], excludes=[{% for excl in resources[0].excludelist %}'{{ excl }}',{% endfor %}]){%- if filtered_resources -%}
+  + [
+  {%- for name,source,target in filtered_resources %}
+    ':{{ name }}',
+  {% endfor -%}
+  ]
+  {%- endif %},
+  {% if droppath %}resources_root='{{ droppath }}',{%- endif -%}
+	{% if compile %}deps=[{% for dep in compile %}'{{ dep }}',{% endfor %}],
+  {% endif -%}
+	{% if provided %}provided_deps=[{% for dep in provided %}'{{ dep }}',{% endfor %}],{% endif -%}
+	{% if exported %}exported_deps=[{% for dep in exported %}'{{ dep }}',{% endfor %}],{% endif -%}
+	{{ 'tests=[\':%s-test\'],' % modulename if testdir }}
+	visibility={{ visibility or "['PUBLIC']" }},
+	)
+
+zip_file(name='{{ modulename }}.jars', srcs=WAR_DEPS,)
+genrule(name='{{ modulename }}.classes',
+	cmd = 'mkdir -p WEB-INF/classes;unzip $(location :{{ modulename }}.classes-sources) -d WEB-INF/classes;zip -r $OUT WEB-INF',
+	out = '{{ modulename }}_classes.src.zip'
+)
+genrule(name='{{ modulename }}.libs',
+	cmd = 'mkdir -p WEB-INF/lib;unzip -j $(location :{{ modulename }}.jars) -d WEB-INF/lib;zip -r $OUT WEB-INF',
+	out = '{{ modulename }}.libs.src.zip'
+)

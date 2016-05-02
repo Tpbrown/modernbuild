@@ -31,8 +31,9 @@ or simply:
 Many.
 
 - There's an issue with classpaths when running some junit tests.  I'm working on that.
-- It'll handle resources incorrectly if they're defined for both test and 'app'.  Might be the issue driving the above.
-- It doesn't [filter resources](https://maven.apache.org/pom.html#Resources) yet.
+-- UPDATE: Appears to be related to filtered resources being on the classpath appropriately.  Might be working now...
+- ~~It'll handle resources incorrectly if they're defined for both test and 'app'.  Might be the issue driving the above.~~
+- ~~It doesn't [filter resources](https://maven.apache.org/pom.html#Resources) yet.~~
 - Occassionally the sha1 of the fetched dependency doesn't match what was discovered in the local Maven cache. This happened to me while building Maven.
 - Artifacts with the same name but different group IDs will conflict as duplicate Buck rules.  This may be common with historical artifacts originating back in the m1 era... i.e. 'antlr' was an original org, but later became 'org.antlr' .. but perhaps without a relocation defined.
 

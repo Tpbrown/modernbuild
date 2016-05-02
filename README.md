@@ -19,8 +19,8 @@ or simply:
 - mvn dependency:resolve -DoutputFile=tdeps.txt
 - ~/path/to/modernbuild .
 - buck targets
-- buck targets|xargs buck fetch
-- buck test
+- buck fetch it
+- buck targets --type java_test|buck test
 
 
 ##Assumptions

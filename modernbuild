@@ -197,8 +197,8 @@ def walk_workspace_tree():
     TARGET_HEADER = '#!/usr/bin/env python (only used to trigger editor language)\n'
 
     # Create a SQLite db
-    conn = sqlite3.connect('./mvn.db')
-    # conn = sqlite3.connect(':memory:')
+    # conn = sqlite3.connect('./mvn.db')
+    conn = sqlite3.connect(':memory:')
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
 
@@ -444,13 +444,13 @@ def walk_workspace_tree():
         sedcommands.write('s/\${%s}/%s/\n' % (row['name'], value))
     sedcommands.close()
 
-    print "Writing third party dependencies to //externals"
-    if os.path.exists("./externals/BUCK"):
-        os.remove("./externals/BUCK")
-    if not os.path.exists("./externals"):
-        os.mkdir("./externals")
+    print "Writing third party dependencies to //third_party"
+    if os.path.exists("./third_party/BUCK"):
+        os.remove("./third_party/BUCK")
+    if not os.path.exists("./third_party"):
+        os.mkdir("./third_party")
 
-    thirdparty = open("./externals/BUCK", "wr")
+    thirdparty = open("./third_party/BUCK", "wr")
     thirdparty.write(TARGET_HEADER)
 
     # I know this isn't fast...but
@@ -473,14 +473,14 @@ def walk_workspace_tree():
             thirdparty.write('\n# WARN - Dependency appears to be local, but source not found.')
         thirdparty.write(maven_dependency(row['groupid'], row['artifactid'], row[
                          'version'], row['classifier'], row['type'], comment))
-    # top-level target so we can just 'buck fetch externals'.
+    # top-level target so we can just 'buck fetch third_party'.
     alltargets = []
     for row in c.execute(EXTERNAL_SQL):
-        alltargets.append('//externals:' + row['artifactid'])
+        alltargets.append('//third_party:' + row['artifactid'])
     thirdparty.write(
-        "\n\n# Rule to ease downloading externals.  But really people, DON'T.  Check them in.")
+        "\n\n# Rule to ease downloading third_party.  But really people, DON'T.  Check them in.")
     thirdparty.write(
-        "\ngenrule(name='externals', cmd='touch $OUT', out='noop.txt', srcs=[\n\t'%s'\n\t],)" % '\',\n\t\''.join(alltargets))
+        "\ngenrule(name='third_party', cmd='touch $OUT', out='noop.txt', srcs=[\n\t'%s'\n\t],)" % '\',\n\t\''.join(alltargets))
     thirdparty.close()
 
     # Targets for each of the descendants
@@ -781,7 +781,7 @@ def get_grouped_dependencies(group, artifact, scope, conn):
     for dep in eval(funcname):
         # for dep in  get_compile_dependency_list(group,artifact,c):
         if dep['external'] == 'TRUE':
-            external.append(('//externals:%s' % dep['artifact']).encode('ascii', 'ignore'))
+            external.append(('//third_party:%s' % dep['artifact']).encode('ascii', 'ignore'))
         else:
             dep2 = c.execute(FIND_HOMEDIR, (dep['group'], dep['artifact'],)).fetchone()
             if dep2 is None and dep['artifact'].endswith('-test'):
@@ -791,7 +791,7 @@ def get_grouped_dependencies(group, artifact, scope, conn):
             if dep2 is None:
                 user_message("WARN: %s:%s - groupId reflects a source origination but is a prebuilt jar." %
                              (dep['group'], dep['artifact']))
-                external.append(('//externals:%s' % dep['artifact']).encode('ascii', 'ignore'))
+                external.append(('//third_party:%s' % dep['artifact']).encode('ascii', 'ignore'))
             else:
                 internal.append(('%s:%s' % (dep2['homedir'].replace(
                     './', '//'), dep['artifact'])).encode('ascii', 'ignore'))
